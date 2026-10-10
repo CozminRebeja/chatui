@@ -1096,6 +1096,11 @@ impl App {
                         "claude mcp add chatui -- chatui mcp".fg(th().accent),
                     ]),
                     Line::default(),
+                    head("From the shell (not in chat)"),
+                    key("backup <file>", "save your account, without chats"),
+                    key("restore <file>", "put a saved account back"),
+                    key("--version", "print the version"),
+                    Line::default(),
                     head("Message status"),
                     Line::from(vec![
                         "  ◷ ".fg(th().dim),
