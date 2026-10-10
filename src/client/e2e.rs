@@ -33,6 +33,13 @@ struct OlmPickle {
     sessions: BTreeMap<String, Vec<SessionPickle>>,
 }
 
+impl Olm {
+    /// Forgets our encryption sessions with `u`, e.g. after their key changed.
+    pub fn forget(&mut self, u: &str) {
+        self.sessions.remove(u);
+    }
+}
+
 impl Serialize for Olm {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         OlmPickle {

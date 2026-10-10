@@ -32,6 +32,21 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
   can read your chats.
 - **Unverified contacts.** Until you compare safety numbers, a relay could
   substitute keys for a first contact.
+- **Group admin rules only go as far as the admin's signature.** The admin signs
+  who may remove people (a roster, with a key derived from their chatui key, so
+  it survives a backup restore), and a helper's removal carries that proof. But
+  a member only checks a signature against a key the admin sent them directly.
+  Someone invited by another member takes that member's word on who the admin
+  is until the real admin's next signed roster arrives; if they already know the
+  real admin's key, an invite naming them without their signature is refused,
+  and a roster signed by someone else claiming to be admin is flagged, not
+  believed. A group whose admin runs an older chatui has no signatures and
+  works as before. Groups made before admins existed have none until a member
+  runs `/claim`. Whoever claims first wins, but if two members claim at the
+  same moment they can end up with different admins.
+- **Notifications on screen.** `/notify` shows the sender and the first 100
+  characters of a message on your desktop, where anyone looking at the screen
+  can see them. `/notify hide` shows only "New message" instead.
 
 ## Reporting a problem
 

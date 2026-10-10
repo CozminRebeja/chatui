@@ -1,6 +1,7 @@
 mod call;
 mod e2e;
 mod media;
+mod sign;
 mod ui;
 
 use crate::theme;
@@ -11,7 +12,8 @@ use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
 use e2e::{Fail, Olm, PREKEYS};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -29,6 +31,15 @@ struct Identity {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Store {
+    /// Set with `/receipts off`: don't tell senders we've read their messages.
+    #[serde(default)]
+    no_receipts: bool,
+    /// Set with `/notify off`: no desktop notifications for new messages.
+    #[serde(default)]
+    no_alerts: bool,
+    /// Set with `/notify hide`: notifications say only "New message", not who or what.
+    #[serde(default)]
+    hide_alert_text: bool,
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
     /// Keys we compared in person (safety numbers) or got through an invite code.
@@ -37,6 +48,14 @@ struct Store {
     expect: BTreeMap<String, String>,
     /// Calls always go through the relay, so nobody we call learns our IP.
     relay_only: bool,
+    /// The signing key each person sent us themselves, in a message only they could
+    /// have made. Group admins sign with it; forget it when their chatui key changes.
+    #[serde(default)]
+    sign_keys: BTreeMap<String, Key>,
+    /// The tour step to show next, saved after every move, so a tour cut short
+    /// by quitting resumes where it stopped. None when there's no tour to show.
+    #[serde(default)]
+    tutorial: Option<usize>,
 }
 
 impl Store {
@@ -58,6 +77,29 @@ struct Chat {
     /// to it or read-receipt it until we do.
     #[serde(default)]
     pending: bool,
+    /// Who made the group. Only the admin can grant or revoke removal rights.
+    /// Empty for groups made before admins existed: nobody can remove people there.
+    #[serde(default)]
+    admin: String,
+    /// Members the admin has let remove people.
+    #[serde(default)]
+    helpers: Vec<String>,
+    /// We were removed (or left): history stays, but we no longer send.
+    #[serde(default)]
+    removed: bool,
+    /// The admin's latest signed statement of who may remove people. None until we've
+    /// seen one, e.g. in a group whose admin runs an older chatui.
+    #[serde(default)]
+    roster: Option<Roster>,
+}
+
+/// What the admin signed: with `seq` counting up, the people allowed to remove
+/// others. The signature also covers the group id and the admin's name.
+#[derive(Serialize, Deserialize, Clone)]
+struct Roster {
+    seq: u64,
+    sig: Vec<u8>,
+    helpers: Vec<String>,
 }
 
 impl Chat {
@@ -70,11 +112,41 @@ impl Chat {
             msgs: vec![],
             created: Utc::now(),
             pending: false,
+            admin: String::new(),
+            helpers: vec![],
+            removed: false,
+            roster: None,
         }
     }
     fn last_activity(&self) -> DateTime<Utc> {
         self.msgs.last().map_or(self.created, |m| m.ts)
     }
+
+    /// Takes a roster that has already checked out: from now on, the people allowed
+    /// to remove others are exactly the ones the admin signed (who are still here).
+    fn adopt_roster(&mut self, m: &Payload, me: &str) {
+        self.helpers = m
+            .helpers
+            .iter()
+            .filter(|h| (self.members.contains(h) || *h == me) && **h != self.admin)
+            .cloned()
+            .collect();
+        self.roster = Some(Roster {
+            seq: m.seq,
+            sig: m.sig.clone(),
+            helpers: m.helpers.clone(),
+        });
+    }
+}
+
+/// What a signed roster tells us about a group.
+enum Judged {
+    /// Signed by the admin, with the signing key we already hold for them.
+    Valid,
+    /// We hold the admin's key, and this doesn't match it.
+    Invalid,
+    /// We don't hold the admin's key (yet), or the group has no admin: can't say.
+    Unknown,
 }
 
 /// Own messages: Pending -> Sent (server has it) -> Read (every member read it).
@@ -138,6 +210,19 @@ struct Payload {
     reply: Option<Quote>,
     #[serde(skip_serializing_if = "Option::is_none")]
     call: Option<Sig>,
+    /// Group admin, sent with invites.
+    #[serde(default)]
+    admin: String,
+    /// The sender's signing key. Only believed for the sender themselves.
+    #[serde(default)]
+    akey: Option<Key>,
+    /// A signed roster: its number, the admin's signature, and who may remove people.
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    sig: Vec<u8>,
+    #[serde(default)]
+    helpers: Vec<String>,
 }
 
 enum Ev {
@@ -196,6 +281,8 @@ struct App {
     ring: Option<Ring>,
     /// Group chat id → a call someone started there, that we could join.
     ongoing: BTreeMap<String, String>,
+    /// Whether the terminal window has focus (from focus events).
+    focused: bool,
 }
 
 /// Longest message we send, so it stays well under the relay's size limit.
@@ -215,6 +302,93 @@ fn rand_id() -> String {
     let mut b = [0u8; 12];
     OsRng.fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The text of a desktop notification: who, where for groups, then the message (shortened).
+fn alert_text(from: &str, group: Option<&str>, text: &str) -> String {
+    let short: String = text.chars().take(100).collect();
+    match group {
+        Some(g) => format!("{from} in #{g}: {short}"),
+        None => format!("{from}: {short}"),
+    }
+}
+
+/// Shows a desktop notification with the system's own tool: notify-send on Linux,
+/// Notification Center on macOS, a balloon tip on Windows. The text goes in as an
+/// environment variable, never through a shell, so it can't be interpreted.
+fn notify_desktop(body: &str) {
+    let mut cmd = if cfg!(target_os = "linux") {
+        let mut c = std::process::Command::new("notify-send");
+        c.args(["--app-name=chatui", "chatui", body]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("osascript");
+        c.args([
+            "-e",
+            r#"display notification (system attribute "CHATUI_BODY") with title "chatui""#,
+        ]);
+        c.env("CHATUI_BODY", body);
+        c
+    } else {
+        let mut c = std::process::Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; \
+             $n.BalloonTipTitle = 'chatui'; $n.BalloonTipText = $env:CHATUI_BODY; \
+             $n.ShowBalloonTip(5000); Start-Sleep -Seconds 6; $n.Dispose()",
+        ]);
+        c.env("CHATUI_BODY", body);
+        c
+    };
+    let _ = cmd.spawn();
+}
+
+/// What a roster signature covers: the admin, then everyone allowed to remove
+/// people, in a fixed order.
+fn roster_args(admin: &str, helpers: &[String]) -> Vec<String> {
+    let mut hs = helpers.to_vec();
+    hs.sort();
+    hs.dedup();
+    std::iter::once(admin.to_string()).chain(hs).collect()
+}
+
+/// Did the owner of signing key `key` sign this roster for group `chat`, naming
+/// `admin`? Signed with a different admin name, group, or list, it fails.
+fn roster_valid(
+    key: &Key,
+    chat: &str,
+    admin: &str,
+    seq: u64,
+    helpers: &[String],
+    sig: &[u8],
+) -> bool {
+    let args = roster_args(admin, helpers);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let r = sign::Record {
+        chat,
+        seq,
+        kind: "roster",
+        args: &args,
+    };
+    sign::verify(key, &r, sig)
+}
+
+/// May `who` remove `target` from the group? The admin can remove anyone but
+/// themselves. A member the admin has let remove people can remove members,
+/// but not the admin or another such member.
+fn may_remove(c: &Chat, who: &str, target: &str) -> bool {
+    if c.admin.is_empty() || target == c.admin || target == who {
+        return false;
+    }
+    if who == c.admin {
+        return true;
+    }
+    c.helpers.iter().any(|h| h == who) && !c.helpers.iter().any(|h| h == target)
 }
 
 /// Strips control characters and invisible direction marks, which can make a name
@@ -284,7 +458,7 @@ struct MouseGuard;
 
 impl Drop for MouseGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     }
 }
 
@@ -352,13 +526,15 @@ pub fn run() -> Result<(), String> {
         call: None,
         ring: None,
         ongoing: BTreeMap::new(),
+        focused: true,
     };
     app.reload_theme();
+    app.resume_tutorial();
     if app.setup.is_none() {
         app.connect();
     }
     let mut term = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     // turns mouse capture off even if the app panics, otherwise the shell gets mouse movements as typed input
     let mouse = MouseGuard;
     let res = app.run_loop(&mut term, rx);
@@ -383,6 +559,8 @@ impl App {
                 match event::read().map_err(|e| e.to_string())? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
                     Event::Mouse(m) => self.on_mouse(m),
+                    Event::FocusGained => self.focused = true,
+                    Event::FocusLost => self.focused = false,
                     _ => {}
                 }
             }
@@ -432,6 +610,297 @@ impl App {
                 self.theme_err = e;
             }
             Err(_) => {}
+        }
+    }
+
+    /// Opens the tour from the first step, and saves that it's in progress.
+    fn start_tutorial(&mut self) {
+        self.set_tutorial_step(0);
+        self.popup = Some(Popup::Tutorial(0));
+    }
+
+    /// Records the tour's current step, so it survives quitting mid-tour.
+    fn set_tutorial_step(&mut self, step: usize) {
+        self.store.tutorial = Some(step);
+        self.commit();
+    }
+
+    /// Closes the tour for good.
+    fn finish_tutorial(&mut self) {
+        self.popup = None;
+        self.store.tutorial = None;
+        self.commit();
+    }
+
+    /// On startup, pick up a tour that was cut short.
+    fn resume_tutorial(&mut self) {
+        if let (Some(step), true) = (self.store.tutorial, self.setup.is_none()) {
+            self.popup = Some(Popup::Tutorial(step));
+        }
+    }
+
+    /// Accepts `u`'s new key, after you've compared safety numbers: forgets the old key,
+    /// its verification and its encryption sessions, then fetches the new key.
+    pub(super) fn accept_new_key(&mut self, u: &str) -> Result<(), String> {
+        if !self.store.contacts.contains_key(u) {
+            return Err(format!("there's no key for {u} to replace"));
+        }
+        if self.conn.is_none() {
+            return Err("offline — try again when connected".into());
+        }
+        self.store.contacts.remove(u);
+        self.store.verified.remove(u);
+        self.store.expect.remove(u);
+        self.store.sign_keys.remove(u); // their new chatui key signs with a new key
+        self.olm.forget(u);
+        let _ = self.save_olm();
+        self.commit();
+        self.request_keys(vec![u.into()], String::new(), String::new())?;
+        self.notify(
+            format!("accepted {u}'s new key — compare safety numbers (i) to be sure"),
+            false,
+        );
+        Ok(())
+    }
+
+    /// The open group, if we can still act in it.
+    fn open_group(&self) -> Result<usize, String> {
+        match self.store.chats.get(self.sel) {
+            Some(c) if c.group && c.removed => Err("you're no longer in this group".into()),
+            Some(c) if c.group && !c.pending => Ok(self.sel),
+            Some(c) if c.group => Err("join the group first (y)".into()),
+            _ => Err("open a group first".into()),
+        }
+    }
+
+    /// Sends a membership change to everyone in the group, and to `extra` if given.
+    fn announce(&mut self, ci: usize, p: Payload, extra: Option<&str>) {
+        let mut to = self.store.chats[ci].members.clone();
+        to.extend(extra.map(String::from));
+        for u in to {
+            self.send_to(&u, "", &p);
+        }
+    }
+
+    /// Removes `user` from the open group, if our rights allow it.
+    pub(super) fn remove_member(&mut self, user: &str) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        if !may_remove(c, &self.me, user) {
+            return Err(if c.admin == self.me || c.helpers.contains(&self.me) {
+                format!("you can't remove {user}")
+            } else {
+                "only the group admin, or someone they've allowed, can remove people".into()
+            });
+        }
+        // a helper shows the admin's signed roster as proof they may do this
+        let proof = c.roster.clone().filter(|_| c.admin != self.me);
+        let p = Payload {
+            t: "remove".into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            seq: proof.as_ref().map_or(0, |r| r.seq),
+            sig: proof.as_ref().map(|r| r.sig.clone()).unwrap_or_default(),
+            helpers: proof.map(|r| r.helpers).unwrap_or_default(),
+            ..Default::default()
+        };
+        self.announce(ci, p, Some(user));
+        let c = &mut self.store.chats[ci];
+        c.members.retain(|m| m != user);
+        c.helpers.retain(|m| m != user);
+        c.msgs.push(notice(format!("you removed {user}")));
+        self.commit();
+        Ok(())
+    }
+
+    /// Lets `user` remove people from the open group, or takes that back. Admin only.
+    pub(super) fn set_helper(&mut self, user: &str, grant: bool) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin != self.me {
+            return Err("only the group admin can change who may remove people".into());
+        }
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        if c.helpers.iter().any(|h| h == user) == grant {
+            return Err(if grant {
+                format!("{user} can already remove people")
+            } else {
+                format!("{user} can't remove people")
+            });
+        }
+        let p = Payload {
+            t: if grant { "grant" } else { "revoke" }.into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        if grant {
+            c.helpers.push(user.into());
+            c.msgs.push(notice(format!("you let {user} remove people")));
+        } else {
+            c.helpers.retain(|h| h != user);
+            c.msgs
+                .push(notice(format!("you stopped {user} removing people")));
+        }
+        self.announce_roster(ci);
+        self.commit();
+        Ok(())
+    }
+
+    /// Does the roster in `m` check out against the signing key we hold for `c`'s admin?
+    fn judge_roster(&self, c: &Chat, m: &Payload) -> Judged {
+        let Some(key) = self
+            .store
+            .sign_keys
+            .get(&c.admin)
+            .filter(|_| !c.admin.is_empty())
+        else {
+            return Judged::Unknown;
+        };
+        if m.seq > 0 && roster_valid(key, &c.id, &c.admin, m.seq, &m.helpers, &m.sig) {
+            Judged::Valid
+        } else {
+            Judged::Invalid
+        }
+    }
+
+    /// Admin only: sign who may remove people now, keep it, and tell the group. Members
+    /// check it against our signing key, so a roster passed on by someone else
+    /// can still be trusted.
+    fn announce_roster(&mut self, ci: usize) {
+        let c = &self.store.chats[ci];
+        if c.admin != self.me {
+            return;
+        }
+        let seq = c.roster.as_ref().map_or(0, |r| r.seq) + 1;
+        let (chat, helpers) = (c.id.clone(), c.helpers.clone());
+        let args = roster_args(&self.me, &helpers);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let sig = sign::sign(
+            &self.sk,
+            &sign::Record {
+                chat: &chat,
+                seq,
+                kind: "roster",
+                args: &args,
+            },
+        );
+        let p = Payload {
+            t: "roster".into(),
+            chat,
+            admin: self.me.clone(),
+            helpers: helpers.clone(),
+            seq,
+            sig: sig.clone(),
+            akey: Some(sign::public_key(&self.sk)),
+            ..Default::default()
+        };
+        self.store.chats[ci].roster = Some(Roster { seq, sig, helpers });
+        self.announce(ci, p, None);
+    }
+
+    /// Hands the open group's admin role to `user`. Admin only; then the old admin
+    /// can leave like anyone else.
+    pub(super) fn hand_over(&mut self, user: &str) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin != self.me {
+            return Err("only the group admin can hand the group over".into());
+        }
+        if user == self.me {
+            return Err("that's you".into());
+        }
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        let p = Payload {
+            t: "handover".into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.admin = user.into();
+        c.helpers.retain(|h| h != user);
+        c.roster = None; // the new admin signs the next one
+        c.msgs
+            .push(notice(format!("you handed the group to {user}")));
+        self.commit();
+        Ok(())
+    }
+
+    /// Takes over a group that has no admin (one made before admins existed).
+    /// Only works while nobody holds the role.
+    pub(super) fn claim_group(&mut self) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if !c.admin.is_empty() {
+            return Err(format!("{} is the admin of this group", c.admin));
+        }
+        let p = Payload {
+            t: "claim".into(),
+            chat: c.id.clone(),
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.admin = self.me.clone();
+        c.roster = None;
+        c.msgs
+            .push(notice("you are now the admin of this group".into()));
+        self.announce_roster(ci);
+        self.commit();
+        Ok(())
+    }
+
+    /// Leaves the open group. The admin hands the group over first.
+    pub(super) fn leave_group(&mut self) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin == self.me {
+            return Err("hand the group over first: /handover <name>".into());
+        }
+        let p = Payload {
+            t: "leave".into(),
+            chat: c.id.clone(),
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.removed = true;
+        c.members.clear();
+        c.helpers.clear();
+        c.msgs.push(notice("you left".into()));
+        self.commit();
+        Ok(())
+    }
+
+    /// `/remove`, `/grant`, `/revoke` and `/leave` in the message box.
+    /// Returns None when the text isn't one of these.
+    pub(super) fn group_command(&mut self, text: &str) -> Option<Result<(), String>> {
+        let (cmd, arg) = text
+            .split_once(' ')
+            .map_or((text, ""), |(c, a)| (c, a.trim()));
+        let needs_name = matches!(cmd, "/remove" | "/grant" | "/revoke" | "/handover");
+        if needs_name && arg.is_empty() {
+            return Some(Err(format!("usage: {cmd} <name>")));
+        }
+        match cmd {
+            "/remove" => Some(self.remove_member(arg)),
+            "/grant" => Some(self.set_helper(arg, true)),
+            "/revoke" => Some(self.set_helper(arg, false)),
+            "/handover" => Some(self.hand_over(arg)),
+            "/claim" => Some(self.claim_group()),
+            "/leave" => Some(self.leave_group()),
+            _ => None,
         }
     }
 
@@ -552,6 +1021,7 @@ impl App {
                 } else {
                     self.notify("You're in! Press v to invite your friends.", false);
                 }
+                self.start_tutorial();
             }
         }
     }
@@ -748,6 +1218,9 @@ impl App {
     }
 
     fn send_text(&mut self, text: String) {
+        if self.store.chats.get(self.sel).is_some_and(|c| c.removed) {
+            return self.notify("you're no longer in this group", true);
+        }
         let Some(c) = self.store.chats.get(self.sel) else {
             return self.notify("start a chat first (n)", true);
         };
@@ -781,7 +1254,11 @@ impl App {
 
     /// Send read receipts for everything unread in the open chat.
     fn mark_read(&mut self) {
-        if self.conn.is_none() || self.setup.is_some() || self.sel >= self.store.chats.len() {
+        if self.store.no_receipts
+            || self.conn.is_none()
+            || self.setup.is_some()
+            || self.sel >= self.store.chats.len()
+        {
             return;
         }
         let c = &self.store.chats[self.sel];
@@ -1141,21 +1618,47 @@ impl App {
             let id = format!("g{}", rand_id());
             let mut members = p.keys.clone();
             members.insert(self.me.clone(), self.sk.public_key().to_bytes());
+            // the first roster: me as admin, nobody else allowed to remove people yet
+            let args = roster_args(&self.me, &[]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let sig = sign::sign(
+                &self.sk,
+                &sign::Record {
+                    chat: &id,
+                    seq: 1,
+                    kind: "roster",
+                    args: &args,
+                },
+            );
             let invite = Payload {
                 t: "group".into(),
                 chat: id.clone(),
                 name: p.group.clone(),
                 members,
+                admin: self.me.clone(),
+                seq: 1,
+                sig: sig.clone(),
+                akey: Some(sign::public_key(&self.sk)),
                 ..Default::default()
             };
             for u in &p.users {
                 self.send_to(u, "", &invite);
             }
-            self.add_chat(Chat::new(id, p.group, p.users, true))
+            let mut c = Chat::new(id, p.group, p.users, true);
+            c.admin = self.me.clone();
+            c.roster = Some(Roster {
+                seq: 1,
+                sig,
+                helpers: vec![],
+            });
+            self.add_chat(c)
         };
         self.sel = ci;
         self.scroll = 0;
-        self.popup = None;
+        // a reply from a friend must not close the first-run tour
+        if !matches!(self.popup, Some(Popup::Tutorial(_))) {
+            self.popup = None;
+        }
         self.focus = Focus::Input;
         self.commit();
     }
@@ -1180,11 +1683,20 @@ impl App {
         };
         let mut members = keys(&[old.as_slice(), &new].concat());
         members.insert(self.me.clone(), self.sk.public_key().to_bytes());
+        // pass on the admin's signed roster, so a newcomer who already knows the
+        // admin's signing key can check who admins this group
+        let c = &self.store.chats[ci];
+        let roster = c.roster.clone();
         let invite = Payload {
             t: "group".into(),
             chat: id.clone(),
             name,
             members,
+            admin: c.admin.clone(),
+            seq: roster.as_ref().map_or(0, |r| r.seq),
+            sig: roster.as_ref().map(|r| r.sig.clone()).unwrap_or_default(),
+            helpers: roster.map(|r| r.helpers).unwrap_or_default(),
+            akey: (c.admin == self.me).then(|| sign::public_key(&self.sk)),
             ..Default::default()
         };
         let added = Payload {
@@ -1251,6 +1763,13 @@ impl App {
             return;
         }
         self.pin_key(&from, key);
+        // a signing key is believed only for the person who sent it, the first time,
+        // and a different one later is refused
+        if let Some(k) = m.akey
+            && *self.store.sign_keys.entry(from.clone()).or_insert(k) != k
+        {
+            return;
+        }
         if !m.chat.is_empty() && !valid_group_id(&m.chat) {
             return;
         }
@@ -1310,6 +1829,14 @@ impl App {
                 // or before 1970: times at chrono's limits crash local-time display
                 let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
                 let ts = m.ts.clamp(epoch, Utc::now());
+                let open_chat = self.sel == ci;
+                let alert = (!self.store.no_alerts && !(self.focused && open_chat)).then(|| {
+                    if self.store.hide_alert_text {
+                        "New message".to_string()
+                    } else {
+                        alert_text(&from, c.group.then_some(c.name.as_str()), &text)
+                    }
+                });
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -1334,6 +1861,9 @@ impl App {
                         .write_all(b"\x07")
                         .and_then(|_| io::stdout().flush());
                     self.notify(ping, false);
+                }
+                if let Some(body) = alert {
+                    notify_desktop(&body);
                 }
             }
             "read" => {
@@ -1377,7 +1907,24 @@ impl App {
                 if name.is_empty() {
                     name = "group".into();
                 }
-                let mut c = Chat::new(m.chat, name, members, true);
+                let mut c = Chat::new(m.chat.clone(), name, members, true);
+                c.admin = if valid_name(&m.admin) {
+                    m.admin.clone()
+                } else {
+                    String::new()
+                };
+                match self.judge_roster(&c, &m) {
+                    Judged::Valid => c.adopt_roster(&m, &self.me),
+                    Judged::Invalid => {
+                        c.msgs.push(notice(format!(
+                            "couldn't confirm {} as this group's admin, so nobody \
+                             can remove people until the real admin acts",
+                            c.admin
+                        )));
+                        c.admin = String::new();
+                    }
+                    Judged::Unknown => {}
+                }
                 c.pending = true;
                 c.msgs
                     .push(notice(format!("{from} added you · y joins, d declines")));
@@ -1387,6 +1934,127 @@ impl App {
                     false,
                 );
                 self.sync_keys();
+            }
+            "remove" | "grant" | "revoke" | "leave" | "handover" | "claim" => {
+                let Some(ci) = self.find(&m.chat).filter(|_| !m.chat.is_empty()) else {
+                    return;
+                };
+                let target = m.ids.first().cloned().unwrap_or_default();
+                let me = self.me.clone();
+                let c = &mut self.store.chats[ci];
+                let mut announce = false; // we've just become the admin: sign the roster
+                match m.t.as_str() {
+                    "remove" => {
+                        // a helper whose grant we missed can prove it with the admin's
+                        // signed roster, which also brings us up to date
+                        let newer = m.seq > c.roster.as_ref().map_or(0, |r| r.seq);
+                        if from != c.admin
+                            && !c.helpers.contains(&from)
+                            && newer
+                            && m.helpers.contains(&from)
+                            && self.store.sign_keys.get(&c.admin).is_some_and(|k| {
+                                roster_valid(k, &c.id, &c.admin, m.seq, &m.helpers, &m.sig)
+                            })
+                        {
+                            c.adopt_roster(&m, &me);
+                        }
+                        if !may_remove(c, &from, &target) {
+                            return;
+                        }
+                        if target == me {
+                            c.removed = true;
+                            c.members.clear();
+                            c.helpers.clear();
+                            c.msgs
+                                .push(notice(format!("{from} removed you from this group")));
+                        } else {
+                            c.members.retain(|u| *u != target);
+                            c.helpers.retain(|u| *u != target);
+                            c.msgs.push(notice(format!("{from} removed {target}")));
+                        }
+                    }
+                    "grant" | "revoke" => {
+                        if from != c.admin || target.is_empty() {
+                            return;
+                        }
+                        let grant = m.t == "grant";
+                        c.helpers.retain(|u| *u != target);
+                        if grant {
+                            c.helpers.push(target.clone());
+                        }
+                        let what = if grant { "let" } else { "stopped" };
+                        c.msgs
+                            .push(notice(format!("{from} {what} {target} remove people")));
+                    }
+                    "handover" => {
+                        // our own member list leaves us out, so check for ourselves too
+                        if from != c.admin || !(c.members.contains(&target) || target == me) {
+                            return;
+                        }
+                        c.admin = target.clone();
+                        c.helpers.retain(|u| *u != target);
+                        c.roster = None; // the new admin signs the next one
+                        announce = target == me;
+                        c.msgs
+                            .push(notice(format!("{from} handed the group to {target}")));
+                    }
+                    "claim" => {
+                        // only a group with no admin can be claimed, by one of its members
+                        if !c.admin.is_empty() || !c.members.contains(&from) {
+                            return;
+                        }
+                        c.admin = from.clone();
+                        c.roster = None;
+                        c.msgs.push(notice(format!("{from} is now the admin")));
+                    }
+                    _ => {
+                        if !c.members.contains(&from) {
+                            return;
+                        }
+                        c.members.retain(|u| *u != from);
+                        c.helpers.retain(|u| *u != from);
+                        c.msgs.push(notice(format!("{from} left")));
+                    }
+                }
+                if announce {
+                    self.announce_roster(ci);
+                }
+            }
+            "roster" => {
+                let Some(ci) = self.find(&m.chat).filter(|_| !m.chat.is_empty()) else {
+                    return;
+                };
+                let c = &self.store.chats[ci];
+                if !c.group || !c.members.contains(&from) || c.admin.is_empty() {
+                    return;
+                }
+                // a roster counts when the admin signed it with the key they sent us
+                let newer = m.seq > c.roster.as_ref().map_or(0, |r| r.seq);
+                let signed = self
+                    .store
+                    .sign_keys
+                    .get(&from)
+                    .is_some_and(|k| roster_valid(k, &c.id, &from, m.seq, &m.helpers, &m.sig));
+                if from == c.admin {
+                    if !newer || !signed {
+                        return;
+                    }
+                    self.store.chats[ci].adopt_roster(&m, &self.me);
+                } else if signed && c.roster.is_none() {
+                    // someone else signs as the admin, and we never heard from the one
+                    // we were told about: don't pick, say so
+                    let text = format!(
+                        "{from} says they're this group's admin, but you were told {}. \
+                         Ask the group who it is.",
+                        c.admin
+                    );
+                    let c = &mut self.store.chats[ci];
+                    if c.msgs.iter().all(|x| x.text != text) {
+                        c.msgs.push(notice(text));
+                    }
+                } else {
+                    return;
+                }
             }
             "rename" => {
                 let Some(ci) = self.find(&m.chat) else { return };
@@ -1482,6 +2150,7 @@ mod tests {
             call: None,
             ring: None,
             ongoing: BTreeMap::new(),
+            focused: true,
         };
         let (code, pin) = split_invite(invite);
         let login = handshake(server, me, &a.sk, &code).unwrap();
@@ -2325,5 +2994,634 @@ mod tests {
         // ordinary text and emoji with joiners are untouched
         assert_eq!(clean("ăîșț 😀"), "ăîșț 😀");
         assert_eq!(clean("👨\u{200D}👩\u{200D}👧"), "👨\u{200D}👩\u{200D}👧");
+    }
+
+    #[test]
+    fn tutorial_opens_on_command_and_closes_once_seen() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        assert!(alice.store.tutorial.is_none());
+
+        alice.focus = Focus::Input;
+        for c in "/tutorial".chars() {
+            alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(0))));
+        assert!(
+            alice.input.text.is_empty(),
+            "/tutorial is not sent as a message"
+        );
+
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(1))),
+            "Enter goes to the next step"
+        );
+
+        alice.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(alice.popup.is_none());
+        assert!(alice.store.tutorial.is_none(), "closing it for good");
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn friend_reply_keeps_the_tour_open() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.start_tutorial();
+        let bob = SecretKey::generate(&mut OsRng).public_key().to_bytes();
+        alice.on_keys(Pkt {
+            users: vec!["bob".into()],
+            keys: BTreeMap::from([("bob".to_string(), bob)]),
+            ..Default::default()
+        });
+        assert!(alice.find("bob").is_some(), "the chat was opened");
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(0))),
+            "the tour stays open"
+        );
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn notify_hide_and_show_toggle_the_text() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let mut type_line = |alice: &mut App, line: &str| {
+            alice.focus = Focus::Input;
+            for c in line.chars() {
+                alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        assert!(!alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify hide");
+        assert!(alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify show");
+        assert!(!alice.store.hide_alert_text);
+        fs::remove_file(&state).ok();
+    }
+
+    /// Quitting mid-tour: the step is on disk, and the next start picks it up.
+    #[test]
+    fn tutorial_resumes_after_quitting_midway() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.start_tutorial();
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(2))));
+
+        // as if the app was killed here: read the saved history back from disk
+        let saved = load_store(&alice.dir, &alice.vault).unwrap();
+        assert_eq!(saved.tutorial, Some(2));
+
+        alice.popup = None;
+        alice.store = saved;
+        alice.resume_tutorial();
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(2))),
+            "resumes at step 3"
+        );
+    }
+
+    #[test]
+    fn receipts_can_be_turned_off() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let bob = SecretKey::generate(&mut OsRng);
+        alice
+            .store
+            .contacts
+            .insert("bob".into(), bob.public_key().to_bytes());
+        alice.store.chats.push(Chat::new(
+            "bob".into(),
+            "bob".into(),
+            vec!["bob".into()],
+            false,
+        ));
+        alice.store.chats[0].msgs.push(Msg {
+            id: "m1".into(),
+            from: "bob".into(),
+            text: "hi".into(),
+            ts: Utc::now(),
+            status: Status::Pending,
+            read_by: vec![],
+            reply: None,
+        });
+        alice.sel = 0;
+
+        alice.store.no_receipts = true;
+        alice.mark_read();
+        assert!(
+            matches!(alice.store.chats[0].msgs[0].status, Status::Pending),
+            "no receipt sent"
+        );
+
+        alice.store.no_receipts = false;
+        alice.mark_read();
+        assert!(
+            matches!(alice.store.chats[0].msgs[0].status, Status::Read),
+            "receipt sent when on"
+        );
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn alert_text_names_the_sender_and_group() {
+        assert_eq!(alert_text("bob", None, "hi"), "bob: hi");
+        assert_eq!(alert_text("bob", Some("trip"), "hi"), "bob in #trip: hi");
+        let long = "x".repeat(300);
+        assert_eq!(
+            alert_text("bob", None, &long).chars().count(),
+            "bob: ".len() + 100
+        );
+    }
+
+    /// The `/receipts` command switches read receipts off and on.
+    #[test]
+    fn receipts_command_switches_them_off_and_on() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.focus = Focus::Input;
+        let type_line = |a: &mut App, line: &str| {
+            for c in line.chars() {
+                a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        type_line(&mut alice, "/receipts off");
+        assert!(alice.store.no_receipts);
+        type_line(&mut alice, "/receipts on");
+        assert!(!alice.store.no_receipts);
+        assert!(alice.input.text.is_empty());
+    }
+
+    /// After someone reinstalls, their key changes. The old one is refused until you
+    /// accept the new one, which should follow a safety number check.
+    #[test]
+    fn new_key_is_accepted_only_on_request() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (bob, _rb) = app(&addr, "bob", &code);
+
+        // alice still has bob's old key, and had verified it
+        let old: Key = [9; 32];
+        alice.store.contacts.insert("bob".into(), old);
+        alice.store.verified.insert("bob".into(), old);
+        assert!(
+            alice.check_key("bob", &pk(&bob)).is_err(),
+            "new key refused by default"
+        );
+
+        assert!(
+            alice.accept_new_key("nobody").is_err(),
+            "nothing to replace"
+        );
+        alice.accept_new_key("bob").unwrap();
+        until(&mut alice, &ra, |a| {
+            a.store.contacts.get("bob") == Some(&pk(&bob))
+        });
+        assert!(!alice.verified("bob"), "the new key must be checked again");
+    }
+
+    #[test]
+    fn may_remove_rules() {
+        let mut c = Chat::new(
+            "g1".into(),
+            "trip".into(),
+            vec!["bob".into(), "carol".into(), "dave".into()],
+            true,
+        );
+        c.admin = "alice".into();
+        assert!(may_remove(&c, "alice", "bob"));
+        assert!(
+            !may_remove(&c, "alice", "alice"),
+            "the admin can't remove themselves"
+        );
+        assert!(!may_remove(&c, "bob", "carol"), "ordinary members can't");
+        c.helpers.push("bob".into());
+        assert!(may_remove(&c, "bob", "carol"));
+        assert!(!may_remove(&c, "bob", "alice"), "never the admin");
+        c.helpers.push("carol".into());
+        assert!(
+            !may_remove(&c, "bob", "carol"),
+            "helpers can't remove helpers"
+        );
+        c.admin.clear();
+        assert!(
+            !may_remove(&c, "bob", "dave"),
+            "old groups without an admin: nobody"
+        );
+    }
+
+    #[test]
+    fn group_rules_admin_helpers_and_leaving() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        for a in [&mut alice, &mut bob, &mut carol] {
+            a.sel = a.find(&gid).unwrap();
+        }
+
+        // ordinary members can't remove anyone or hand out rights
+        assert!(bob.remove_member("carol").is_err());
+        assert!(bob.set_helper("carol", true).is_err());
+
+        // the admin lets bob remove people; bob removes carol
+        alice.set_helper("bob", true).unwrap();
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| c.helpers.contains(&"bob".into()))
+        });
+        bob.remove_member("carol").unwrap();
+        settle(&mut bob, &rb);
+        until(&mut carol, &rc, |a| group(a).is_some_and(|c| c.removed));
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"carol".into()))
+        });
+
+        // a removed member can't send any more
+        carol.send_text("still here?".into());
+        assert!(
+            group(&carol)
+                .unwrap()
+                .msgs
+                .iter()
+                .all(|m| m.text != "still here?")
+        );
+
+        // a forged removal of the admin is ignored
+        let forged = Payload {
+            t: "remove".into(),
+            chat: gid.clone(),
+            ids: vec!["alice".into()],
+            ..Default::default()
+        };
+        forge(&mut bob, &rb, &alice, forged);
+        settle(&mut alice, &ra);
+        assert!(!group(&alice).unwrap().removed);
+
+        // the admin can't leave; bob can
+        assert!(alice.leave_group().is_err());
+        bob.leave_group().unwrap();
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"bob".into()))
+        });
+        assert!(group(&bob).unwrap().removed);
+        fs::remove_file(&state).ok();
+    }
+
+    /// A group without an admin can be claimed once; the admin can hand the role
+    /// to someone else, and then leave.
+    #[test]
+    fn handover_and_claim() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        for a in [&mut alice, &mut bob, &mut carol] {
+            a.sel = a.find(&gid).unwrap();
+        }
+
+        // the admin can't leave until someone else has the role
+        assert!(alice.leave_group().unwrap_err().contains("/handover"));
+
+        // an old group has no admin: the first member to claim it gets the role
+        for a in [&mut alice, &mut bob, &mut carol] {
+            let ci = a.find(&gid).unwrap();
+            a.store.chats[ci].admin.clear();
+        }
+        carol.claim_group().unwrap();
+        settle(&mut carol, &rc);
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| c.admin == "carol")
+        });
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| c.admin == "carol")
+        });
+        assert!(bob.claim_group().is_err(), "carol already holds it");
+
+        // the admin hands the group to bob, and then can leave like anyone else
+        assert!(carol.hand_over("nobody").is_err());
+        assert!(bob.hand_over("alice").is_err(), "only the admin can");
+        carol.hand_over("bob").unwrap();
+        settle(&mut carol, &rc);
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| c.admin == "bob")
+        });
+        assert!(carol.leave_group().is_ok());
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"carol".into()))
+        });
+        fs::remove_file(&state).ok();
+    }
+
+    /// Handle `a`'s incoming packets for a moment, to check that something was ignored.
+    fn drain(a: &mut App, rx: &Receiver<Ev>) {
+        let end = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < end {
+            if let Ok(Ev::Pkt(p)) = rx.recv_timeout(Duration::from_millis(20)) {
+                a.on_pkt(p);
+            }
+        }
+    }
+
+    /// alice (admin), bob and carol in one group, all joined.
+    struct Trio {
+        alice: App,
+        ra: Receiver<Ev>,
+        bob: App,
+        rb: Receiver<Ev>,
+        carol: App,
+        rc: Receiver<Ev>,
+        gid: String,
+        state: PathBuf,
+    }
+
+    fn trio() -> Trio {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        for a in [&mut alice, &mut bob, &mut carol] {
+            a.sel = a.find(&gid).unwrap();
+        }
+        Trio {
+            alice,
+            ra,
+            bob,
+            rb,
+            carol,
+            rc,
+            gid,
+            state,
+        }
+    }
+
+    fn roster_seq(a: &App) -> u64 {
+        group(a)
+            .and_then(|c| c.roster.as_ref())
+            .map_or(0, |r| r.seq)
+    }
+
+    /// The admin signs a roster when the group is made and after every change, and
+    /// members keep the newest one.
+    #[test]
+    fn signed_roster_follows_grants_and_revokes() {
+        let mut t = trio();
+        for a in [&t.alice, &t.bob, &t.carol] {
+            assert_eq!(roster_seq(a), 1, "{}", a.me);
+        }
+        // the invite carried the admin's signing key, and members kept it
+        let admin_key = sign::public_key(&t.alice.sk);
+        assert_eq!(t.bob.store.sign_keys.get("alice"), Some(&admin_key));
+        assert_eq!(t.carol.store.sign_keys.get("alice"), Some(&admin_key));
+
+        t.alice.set_helper("bob", true).unwrap();
+        settle(&mut t.alice, &t.ra);
+        until(&mut t.carol, &t.rc, |a| {
+            roster_seq(a) == 2 && group(a).is_some_and(|c| c.helpers == ["bob"])
+        });
+        until(&mut t.bob, &t.rb, |a| roster_seq(a) == 2);
+
+        t.alice.set_helper("bob", false).unwrap();
+        settle(&mut t.alice, &t.ra);
+        until(&mut t.carol, &t.rc, |a| {
+            roster_seq(a) == 3 && group(a).is_some_and(|c| c.helpers.is_empty())
+        });
+        fs::remove_file(&t.state).ok();
+    }
+
+    #[test]
+    fn forged_or_unsigned_rosters_are_ignored() {
+        let mut t = trio();
+        let chat = t.gid.clone();
+
+        // alice's name and key, but a signature that isn't hers
+        let fake = Payload {
+            t: "roster".into(),
+            chat: chat.clone(),
+            admin: "alice".into(),
+            helpers: vec!["carol".into()],
+            seq: 9,
+            sig: vec![0; 64],
+            akey: Some(sign::public_key(&t.alice.sk)),
+            ..Default::default()
+        };
+        forge(&mut t.alice, &t.ra, &t.bob, fake);
+        drain(&mut t.bob, &t.rb);
+        assert!(group(&t.bob).unwrap().helpers.is_empty());
+        assert_eq!(roster_seq(&t.bob), 1);
+
+        // bob signs a roster naming himself, which only means something if he's the admin
+        let args = roster_args("bob", &["bob".into()]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let sig = sign::sign(
+            &t.bob.sk,
+            &sign::Record {
+                chat: &chat,
+                seq: 9,
+                kind: "roster",
+                args: &args,
+            },
+        );
+        let bobs = Payload {
+            t: "roster".into(),
+            chat: chat.clone(),
+            admin: "bob".into(),
+            helpers: vec!["bob".into()],
+            seq: 9,
+            sig,
+            akey: Some(sign::public_key(&t.bob.sk)),
+            ..Default::default()
+        };
+        forge(&mut t.bob, &t.rb, &t.carol, bobs);
+        drain(&mut t.carol, &t.rc);
+        assert!(group(&t.carol).unwrap().helpers.is_empty());
+        assert_eq!(group(&t.carol).unwrap().admin, "alice");
+        assert_eq!(roster_seq(&t.carol), 1);
+        fs::remove_file(&t.state).ok();
+    }
+
+    /// A helper whose grant someone missed proves it with the admin's signed roster.
+    #[test]
+    fn a_helper_can_prove_a_grant_the_receiver_missed() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut dave, rd) = app(&addr, "dave", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into(), "dave".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        join(&mut dave, &rd, &gid);
+        for a in [&mut alice, &mut bob, &mut carol, &mut dave] {
+            a.sel = a.find(&gid).unwrap();
+        }
+        let old = group(&carol).unwrap().roster.clone();
+
+        alice.set_helper("bob", true).unwrap();
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| c.helpers == ["bob"])
+        });
+        until(&mut carol, &rc, |a| roster_seq(a) == 2);
+        until(&mut dave, &rd, |a| roster_seq(a) == 2);
+
+        // carol never got the grant
+        let ci = carol.find(&gid).unwrap();
+        carol.store.chats[ci].helpers.clear();
+        carol.store.chats[ci].roster = old;
+
+        // a removal with a proof that doesn't check out is ignored
+        let bad = Payload {
+            t: "remove".into(),
+            chat: gid.clone(),
+            ids: vec!["dave".into()],
+            seq: 5,
+            sig: vec![0; 64],
+            helpers: vec!["bob".into()],
+            ..Default::default()
+        };
+        forge(&mut bob, &rb, &carol, bad);
+        drain(&mut carol, &rc);
+        let ci = carol.find(&gid).unwrap();
+        assert!(carol.store.chats[ci].members.contains(&"dave".into()));
+
+        // bob's real removal carries the signed roster: carol catches up and goes along
+        bob.remove_member("dave").unwrap();
+        settle(&mut bob, &rb);
+        until(&mut carol, &rc, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"dave".into()))
+        });
+        assert_eq!(group(&carol).unwrap().helpers, ["bob"]);
+        fs::remove_file(&state).ok();
+    }
+
+    /// An invite that names an admin we already know, without that admin's signature,
+    /// isn't believed.
+    #[test]
+    fn an_invite_naming_a_known_admin_needs_their_signature() {
+        let mut t = trio();
+        let members: BTreeMap<String, Key> = [&t.alice, &t.bob, &t.carol]
+            .iter()
+            .map(|a| (a.me.clone(), pk(a)))
+            .collect();
+        let evil = |admin: &str| Payload {
+            t: "group".into(),
+            chat: format!("g{}", rand_id()),
+            name: "evil".into(),
+            members: members.clone(),
+            admin: admin.into(),
+            ..Default::default()
+        };
+
+        // carol learned alice's signing key from the real group; bob claims alice
+        // is admin of another group, with nothing signed
+        let first = evil("alice");
+        let id = first.chat.clone();
+        forge(&mut t.bob, &t.rb, &t.carol, first);
+        drain(&mut t.carol, &t.rc);
+        let c = &t.carol.store.chats[t.carol.find(&id).unwrap()];
+        assert_eq!(c.admin, "", "not confirmed, so nobody is the admin");
+        assert!(c.msgs.iter().any(|m| m.text.contains("couldn't confirm")));
+
+        // naming someone whose key carol has never seen can't be checked: that's the
+        // known limit, until that person's own roster arrives
+        let second = evil("bob");
+        let id = second.chat.clone();
+        forge(&mut t.bob, &t.rb, &t.carol, second);
+        drain(&mut t.carol, &t.rc);
+        assert_eq!(t.carol.store.chats[t.carol.find(&id).unwrap()].admin, "bob");
+        fs::remove_file(&t.state).ok();
+    }
+
+    /// After a handover the new admin signs, and members learn their key.
+    #[test]
+    fn the_new_admin_signs_after_a_handover() {
+        let mut t = trio();
+        t.alice.hand_over("bob").unwrap();
+        settle(&mut t.alice, &t.ra);
+        until(&mut t.bob, &t.rb, |a| {
+            group(a).is_some_and(|c| c.admin == "bob") && roster_seq(a) == 1
+        });
+        settle(&mut t.bob, &t.rb);
+        until(&mut t.carol, &t.rc, |a| {
+            roster_seq(a) == 1 && group(a).is_some_and(|c| c.admin == "bob")
+        });
+        let bob_key = sign::public_key(&t.bob.sk);
+        assert_eq!(t.carol.store.sign_keys.get("bob"), Some(&bob_key));
+        let r = group(&t.carol).unwrap().roster.clone().unwrap();
+        assert!(roster_valid(
+            &bob_key, &t.gid, "bob", r.seq, &r.helpers, &r.sig
+        ));
+        fs::remove_file(&t.state).ok();
+    }
+
+    /// The `/notify` command switches alerts off and on.
+    #[test]
+    fn notify_command_switches_alerts() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.focus = Focus::Input;
+        let type_line = |a: &mut App, line: &str| {
+            for c in line.chars() {
+                a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        assert!(!alice.store.no_alerts, "alerts are on by default");
+        type_line(&mut alice, "/notify off");
+        assert!(alice.store.no_alerts);
+        type_line(&mut alice, "/notify on");
+        assert!(!alice.store.no_alerts);
+        fs::remove_file(&state).ok();
     }
 }

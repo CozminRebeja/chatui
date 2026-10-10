@@ -38,6 +38,8 @@ choose *More info → Run anyway*. To check it's the real thing, compare its
 SHA-256 (`certutil -hashfile chatui.exe SHA256`) with the line in the release's
 `SHA256SUMS`, whose signature (`SHA256SUMS.asc`) is made with the apt key above.
 
+Check which version you have with `chatui --version`.
+
 ## Get started
 
 Run `chatui` and choose a passphrase: your key and messages are encrypted with
@@ -63,6 +65,36 @@ messages. If someone adds you to a group, you join it with `y` or decline with `
 | `i` | safety number to compare in person (`m` marks it verified), group members |
 | `t` or Ctrl-T | pick a theme: default, dracula, gruvbox, nord, solarized, synthwave, or your own |
 | `?` | everything else |
+
+Type these in the message box:
+
+| Command | |
+| --- | --- |
+| `/accept <name>` | accept a friend's new key, after comparing safety numbers (`i`) |
+| `/remove <name>` | group admin: take someone out of the open group |
+| `/grant <name>` / `/revoke <name>` | group admin: let a member remove people, or take that back |
+| `/handover <name>` | group admin: pass the admin role to a member, then you can leave |
+| `/claim` | take over a group that has no admin (made before admins existed) |
+| `/leave` | leave the open group (the admin hands over first) |
+| `/receipts on` / `off` | show or hide read receipts |
+| `/notify on` / `off` | desktop notifications for new messages (Linux, macOS, Windows) |
+| `/notify hide` / `show` | notifications say only "New message", or show who and what |
+| `/tutorial` / `/help` | the first-run tour again / every key |
+
+Whoever makes a group is its admin. Only the admin, or a member the admin has
+granted, can `/remove` people; anyone can `/leave`, except the admin, who
+hands the role over with `/handover` first. A group made before admins existed
+has none: the first member to `/claim` it becomes admin. The admin signs the
+list of who may remove people, so members can check it and a helper's removal
+works even if someone missed the grant. Everyone in a group needs 0.9.8 or newer
+for the group rules, and the newest version for the signed list; older ones keep
+working, just without the check.
+
+## Back up your account
+
+`chatui backup <file>` saves your account to one encrypted file, and
+`chatui restore <file>` puts it back on a device (`--force` replaces the account
+already there). Chats are not included, and a backup still needs your passphrase.
 
 ## Calls
 
