@@ -174,7 +174,7 @@ pub fn active_name(dir: &Path) -> String {
     fs::read_to_string(dir.join("theme"))
         .map(|s| s.trim().to_string())
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| valid_name(s))
         .unwrap_or_else(|| "default".into())
 }
 
@@ -184,6 +184,10 @@ pub fn load(dir: &Path, name: &str) -> Result<Theme, String> {
     }
     if let Some((_, spec)) = BUILTIN.iter().find(|(n, _)| *n == name) {
         return parse(&serde_json::from_str(spec).unwrap());
+    }
+    // a name is a file name, never a path
+    if !valid_name(name) {
+        return Err("theme names are 1-20 characters: a-z 0-9 _ -".into());
     }
     let b = fs::read(file(dir, name)).map_err(|e| format!("theme {name}: {e}"))?;
     let v = serde_json::from_slice(&b).map_err(|e| format!("theme {name}: {e}"))?;
@@ -280,6 +284,12 @@ mod tests {
         assert!(save(&dir, "default", &json!({})).is_err());
         assert!(save(&dir, "nord", &json!({})).is_err());
         assert!(save(&dir, "../x", &json!({})).is_err());
+        // reading or activating can't reach outside themes/ either
+        fs::write(dir.join("secret.json"), r#"{"accent": "red"}"#).unwrap();
+        assert!(load(&dir, "../secret").unwrap_err().contains("theme names"));
+        assert!(activate(&dir, "../secret").is_err());
+        fs::write(dir.join("theme"), "../secret").unwrap();
+        assert_eq!(active_name(&dir), "default");
         assert_eq!(
             list(&dir),
             [

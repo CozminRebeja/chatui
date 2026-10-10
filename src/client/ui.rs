@@ -51,6 +51,12 @@ pub enum Popup {
     Invite {
         code: String,
     },
+    /// Relay admins: remove people, or let them back.
+    Admin {
+        user: Field,
+        banned: Vec<String>,
+        err: String,
+    },
     /// Moving the cursor previews the theme live; Esc goes back to the active one.
     Themes {
         names: Vec<String>,
@@ -436,7 +442,7 @@ impl App {
         field(f, s_field, &s.server, s.focus == 1, "chat.example.com");
         f.render_widget(
             help(vec![
-                Line::from("The chatui server your group shares: a domain, or host:port on your own network."),
+                Line::from("The chatui server your group shares, e.g. chat.example.com. Always connects over TLS."),
                 match option_env!("CHATUI_SERVER") {
                     Some(d) => Line::from(vec![
                         "• Your group's server is filled in: ".into(),
@@ -448,14 +454,14 @@ impl App {
                 Line::from(vec![
                     "• Hosting it yourself? On an always-on machine run ".into(),
                     code("brew services start chatui"),
-                    " and use that machine's name with :6769 (same network only).".into(),
+                    " and put it behind TLS, e.g. a Cloudflare Tunnel.".into(),
                 ]),
             ]),
             s_help,
         );
 
         f.render_widget(label("Invite code", s.focus == 2), i_label);
-        field(f, i_field, &s.invite, s.focus == 2, "e.g. 7KQ2M-XH4PD");
+        field(f, i_field, &s.invite, s.focus == 2, "e.g. 7KQ2M-XH4PD-…");
         f.render_widget(
             help(vec![Line::from(
                 "Get one from a friend who's already in (they press v). Leave it empty only \
@@ -535,7 +541,11 @@ impl App {
                 } else {
                     Style::new()
                 };
-                let icon = if c.group { "# " } else { "@ " };
+                let icon = match (c.group, c.pending) {
+                    (_, true) => "? ",
+                    (true, _) => "# ",
+                    _ => "@ ",
+                };
                 let name = truncate(&c.name, w.saturating_sub(time.len() + 3));
                 let top = spread(
                     vec![icon.fg(th().accent), Span::styled(name, name_style)],
@@ -659,7 +669,10 @@ impl App {
             }
             let body = out.len();
             if let Some(q) = &m.reply {
-                let (who, color) = if q.from == self.me {
+                let (who, color) = if q.unconfirmed {
+                    // we don't have the original: this is only the sender's word
+                    (format!("{} (unconfirmed)", q.from), th().dim)
+                } else if q.from == self.me {
                     ("you".to_string(), th().accent)
                 } else {
                     (q.from.clone(), name_color(&q.from))
@@ -729,7 +742,11 @@ impl App {
             Line::from(vec![
                 " @ ".fg(th().accent),
                 c.name.clone().bold(),
-                " · press i to verify keys ".fg(th().dim),
+                if self.verified(&c.id) {
+                    " · ✓ verified ".fg(th().ok)
+                } else {
+                    " · not verified: press i ".fg(th().warn)
+                },
             ])
         };
         let block = pane(title, focused);
@@ -792,6 +809,7 @@ impl App {
                 };
                 format!(" Reply to {who}: {} · Esc cancels ", truncate(&q.text, 30))
             }
+            (Some(c), _) if c.pending => format!(" Join #{}? y joins · d declines ", c.name),
             (Some(c), None) => format!(" Message {}{} ", if c.group { "#" } else { "@" }, c.name),
             (None, _) => " Message ".into(),
         };
@@ -951,10 +969,12 @@ impl App {
                     key("g", "new group (3+ people)"),
                     key("+", "add people to the open group"),
                     key("e", "rename the open group"),
+                    key("y", "join a group someone added you to"),
                     key("@name", "mention someone (Tab completes)"),
-                    key("i", "members & key fingerprints"),
+                    key("i", "members, safety numbers (m marks verified)"),
                     key("d", "remove friend / group from this device"),
                     key("a", "account & server"),
+                    key("B", "relay admins: remove people"),
                     Line::default(),
                     head("Themes"),
                     key("t  or  Ctrl-T", "pick a theme (Ctrl-T works while typing)"),
@@ -987,13 +1007,6 @@ impl App {
                 let Some(c) = self.store.chats.get(self.sel) else {
                     return;
                 };
-                let fp = |u: &str| {
-                    self.store
-                        .contacts
-                        .get(u)
-                        .map(fingerprint)
-                        .unwrap_or("unknown".into())
-                };
                 let mut text = vec![
                     Line::from(vec![
                         (if c.group { "# " } else { "@ " }).fg(th().accent),
@@ -1014,27 +1027,55 @@ impl App {
                     })
                     .fg(th().dim),
                     Line::default(),
-                    Line::from("Key fingerprints").bold(),
                 ];
-                for u in &c.members {
-                    text.push(Line::from(vec![
-                        format!("  {u:<20}").fg(name_color(u)),
-                        fp(u).into(),
-                    ]));
+                let me = self.sk.public_key().to_bytes();
+                let status = |u: &str| {
+                    if self.verified(u) {
+                        "✓ verified".fg(th().ok)
+                    } else if self.store.contacts.contains_key(u) {
+                        "not verified".fg(th().warn)
+                    } else {
+                        "no key yet".fg(th().dim)
+                    }
+                };
+                if c.group {
+                    text.push(Line::from("Members").bold());
+                    for u in &c.members {
+                        text.push(Line::from(vec![
+                            format!("  {u:<20}").fg(name_color(u)),
+                            status(u),
+                        ]));
+                    }
+                    text.push(Line::default());
+                    text.push(
+                        Line::from(
+                            "Verify each person in your direct chat with them (f, their name, i).",
+                        )
+                        .fg(th().dim),
+                    );
+                } else if let Some(k) = self.store.contacts.get(&c.id) {
+                    text.push(Line::from(vec!["Safety number  ".bold(), status(&c.id)]));
+                    let n = safety_number(&me, k);
+                    let (a, b) = n.split_at(n.len() / 2);
+                    text.push(Line::from(format!("  {}", a.trim())).fg(th().accent));
+                    text.push(Line::from(format!("  {}", b.trim())).fg(th().accent));
+                    text.push(Line::default());
+                    text.push(
+                        Line::from(format!(
+                            "{} sees the same number. Compare it in person or on a call;",
+                            c.id
+                        ))
+                        .fg(th().dim),
+                    );
+                    text.push(
+                        Line::from(
+                            "if it matches, nobody can read or fake your messages. Then press m.",
+                        )
+                        .fg(th().dim),
+                    );
+                } else {
+                    text.push(Line::from("No key for them yet.").fg(th().dim));
                 }
-                text.push(Line::from(vec![
-                    format!("  {:<20}", "you").fg(th().accent),
-                    fingerprint(&self.sk.public_key().to_bytes()).into(),
-                ]));
-                text.push(Line::default());
-                text.push(
-                    Line::from("Compare these with your friends in person or over another app.")
-                        .fg(th().dim),
-                );
-                text.push(
-                    Line::from("If they match, nobody can read or fake your messages.")
-                        .fg(th().dim),
-                );
                 let area = centered(screen, 68, text.len() as u16 + 4);
                 f.render_widget(Clear, area);
                 f.render_widget(
@@ -1043,8 +1084,10 @@ impl App {
                             "Chat info",
                             if c.group {
                                 &[("e", "rename"), ("+", "add people"), ("Esc", "close")]
+                            } else if self.verified(&c.id) {
+                                &[("m", "unmark verified"), ("Esc", "close")]
                             } else {
-                                &[("Esc", "close")]
+                                &[("m", "mark verified"), ("Esc", "close")]
                             },
                         )
                         .padding(ratatui::widgets::Padding::uniform(1)),
@@ -1105,8 +1148,12 @@ impl App {
                 );
                 f.render_widget(
                     Line::from(vec![
-                        format!("{:<10}", "Key").fg(th().muted),
-                        fingerprint(&self.sk.public_key().to_bytes()).into(),
+                        format!("{:<10}", "Role").fg(th().muted),
+                        if self.admin {
+                            "relay admin · B removes people".fg(th().accent)
+                        } else {
+                            "member".fg(th().dim)
+                        },
                     ]),
                     rows[1],
                 );
@@ -1325,7 +1372,10 @@ impl App {
                 }
                 f.render_widget(row("Code", code.clone().bold().fg(th().accent)), r_code);
                 f.render_widget(
-                    row("", "single use · expires in 7 days".fg(th().dim)),
+                    row(
+                        "",
+                        "single use · 7 days · vouches for your key".fg(th().dim),
+                    ),
                     r_note,
                 );
                 f.render_widget(
@@ -1336,6 +1386,37 @@ impl App {
                     .wrap(Wrap { trim: true }),
                     r_msg,
                 );
+            }
+            Some(Popup::Admin { user, banned, err }) => {
+                let area = centered(screen, 60, 10);
+                f.render_widget(Clear, area);
+                let block = popup_block(
+                    "Remove people",
+                    &[("⏎", "remove"), ("Ctrl-U", "let back"), ("Esc", "close")],
+                );
+                let inner = block.inner(area).inner(Margin::new(2, 1));
+                f.render_widget(block, area);
+                let rows = Layout::vertical([Constraint::Length(1); 6]).split(inner);
+                input_row(f, rows[0], "Username", user, true, "who to remove");
+                f.render_widget(
+                    Line::from("They're logged out, can't log back in or be messaged,")
+                        .fg(th().dim),
+                    rows[1],
+                );
+                f.render_widget(
+                    Line::from("and their unused invites stop working.").fg(th().dim),
+                    rows[2],
+                );
+                let list = if banned.is_empty() {
+                    "nobody".to_string()
+                } else {
+                    banned.join(", ")
+                };
+                f.render_widget(
+                    Line::from(vec!["Removed: ".fg(th().muted), list.into()]),
+                    rows[4],
+                );
+                f.render_widget(Line::from(err.as_str()).fg(th().error), rows[5]);
             }
             Some(Popup::Themes { names, cursor }) => {
                 let list_h = names.len().min(12) as u16;
@@ -1396,6 +1477,15 @@ impl App {
             self.key_setup(k);
         } else if let Some(p) = self.popup.take() {
             self.key_popup(p, k);
+        } else if self.store.chats.get(self.sel).is_some_and(|c| c.pending)
+            && matches!(k.code, KeyCode::Char('y' | 'd'))
+        {
+            // a group we were added to: join it or decline (remove it)
+            if k.code == KeyCode::Char('y') {
+                self.join_group(self.sel);
+            } else {
+                self.popup = Some(Popup::Delete);
+            }
         } else {
             match self.focus {
                 Focus::Chats => self.key_chats(k),
@@ -1498,6 +1588,14 @@ impl App {
             KeyCode::Char('v') => self.create_invite(),
             KeyCode::Char('t') => self.open_themes(),
             KeyCode::Char('i') if has_chat => self.popup = Some(Popup::Info),
+            KeyCode::Char('B') if self.admin => {
+                let _ = self.moderate(true, ""); // fetch who's removed
+                self.popup = Some(Popup::Admin {
+                    user: Field::default(),
+                    banned: vec![],
+                    err: String::new(),
+                });
+            }
             KeyCode::Char('d') if has_chat => self.popup = Some(Popup::Delete),
             KeyCode::Char('a') => {
                 self.popup = Some(Popup::Account {
@@ -1645,6 +1743,13 @@ impl App {
             Popup::Info if matches!(k.code, KeyCode::Char('e' | '+')) => {
                 return self.key_common(k);
             }
+            Popup::Info if k.code == KeyCode::Char('m') => {
+                if let Some(c) = self.store.chats.get(self.sel).filter(|c| !c.group) {
+                    let u = c.id.clone();
+                    self.toggle_verified(&u);
+                }
+                true
+            }
             Popup::Info => !matches!(
                 k.code,
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i' | 'q')
@@ -1776,8 +1881,29 @@ impl App {
                     true
                 }
             },
+            Popup::Admin { user, err, .. } => match k.code {
+                KeyCode::Esc => false,
+                KeyCode::Enter | KeyCode::Char('u') if k.code == KeyCode::Enter || ctrl(k) => {
+                    let u = user.text.trim().to_string();
+                    let ban = k.code == KeyCode::Enter;
+                    match self.moderate(ban, &u) {
+                        Ok(()) => {
+                            user.take();
+                            err.clear();
+                        }
+                        Err(e) => *err = e,
+                    }
+                    true
+                }
+                _ => {
+                    user.edit(k);
+                    true
+                }
+            },
             Popup::Invite { code } => match k.code {
-                KeyCode::Char('c') | KeyCode::Enter if code.len() == 11 => {
+                KeyCode::Char('c') | KeyCode::Enter
+                    if !code.is_empty() && !code.starts_with("error: ") =>
+                {
                     copy(&invite_message(code));
                     self.notify("copied — paste it to your friend", false);
                     false

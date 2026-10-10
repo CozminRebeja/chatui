@@ -2,11 +2,13 @@ mod client;
 mod mcp;
 mod server;
 mod theme;
+mod vault;
 
 use crypto_box::aead::generic_array::GenericArray;
 use crypto_box::aead::{Aead, AeadCore, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -39,6 +41,10 @@ pub struct Pkt {
     pub data: Vec<u8>,
     pub users: Vec<String>,
     pub keys: BTreeMap<String, Key>,
+    pub admin: bool,
+    /// One-time prekeys we publish, and how many the relay still holds for us.
+    pub otks: Vec<Key>,
+    pub count: usize,
 }
 
 /// Prefix for the login proof, so a malicious server can't trick a client into
@@ -51,11 +57,15 @@ pub type ClientWs = WebSocket<MaybeTlsStream<TcpStream>>;
 /// Read timeout while a connection is live, so `pump` can interleave writes.
 pub const POLL: Duration = Duration::from_millis(50);
 
+/// Largest ciphertext the relay passes along. Byte fields travel as JSON
+/// number arrays (up to 4 chars a byte), hence the bigger socket limit.
+pub const MAX_DATA: usize = 64 << 10;
+
 pub fn ws_config() -> WebSocketConfig {
     // cap message size so a peer can't exhaust memory
     WebSocketConfig::default()
-        .max_message_size(Some(1 << 20))
-        .max_frame_size(Some(1 << 20))
+        .max_message_size(Some(MAX_DATA * 5))
+        .max_frame_size(Some(MAX_DATA * 5))
 }
 
 pub fn send<S: Read + Write>(ws: &mut WebSocket<S>, p: &Pkt) -> bool {
@@ -124,22 +134,45 @@ pub fn pump<S: Read + Write>(
     }
 }
 
-/// "chat.rebeja.co" → wss on 443 (through Cloudflare); "host:port" → plain ws, for a LAN.
-/// Explicit ws:// or wss:// URLs are used as given. Returns (url, host:port).
-fn endpoint(server: &str) -> (String, String) {
+/// Is `host` (a URL's host[:port]) this machine?
+fn loopback(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None if host.matches(':').count() == 1 => host.split(':').next().unwrap_or(host),
+        None => host,
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Always TLS (wss, port 443 unless given): on a plain socket anyone on the network
+/// could see who talks to whom and hand out their own keys. The only exception is
+/// this machine ("localhost:6769" or an explicit ws://localhost). Returns (url, host:port).
+fn endpoint(server: &str) -> Result<(String, String), String> {
     let s = server.trim().trim_end_matches('/');
     let (tls, rest) = match (s.strip_prefix("wss://"), s.strip_prefix("ws://")) {
         (Some(r), _) => (true, r),
         (_, Some(r)) => (false, r),
-        _ => (!s.contains(':') || s.ends_with(":443"), s),
+        _ => (!loopback(s.split('/').next().unwrap_or(s)), s),
     };
     let host = rest.split('/').next().unwrap_or(rest);
-    let addr = if host.contains(':') {
+    if !tls && !loopback(host) {
+        return Err(format!(
+            "refusing unencrypted ws:// to {host}: use the server's TLS address (wss)"
+        ));
+    }
+    let has_port = match host.strip_prefix('[') {
+        Some(v6) => v6.contains("]:"),
+        None => host.matches(':').count() == 1,
+    };
+    let addr = if has_port {
         host.to_string()
     } else {
         format!("{host}:{}", if tls { 443 } else { 80 })
     };
-    (format!("{}://{rest}", if tls { "wss" } else { "ws" }), addr)
+    Ok((format!("{}://{rest}", if tls { "wss" } else { "ws" }), addr))
 }
 
 /// NaCl box: nonce || ciphertext. Authenticates the sender too.
@@ -167,24 +200,87 @@ pub fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-pub fn fingerprint(k: &Key) -> String {
-    k[..8]
-        .chunks(2)
-        .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+/// 60 digits two people compare to check nobody sits between them: the same on
+/// both sides, and full strength (about 199 bits), unlike a short fingerprint.
+pub fn safety_number(a: &Key, b: &Key) -> String {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let h = Sha512::digest([b"chatui-safety-v1:".as_slice(), lo, hi].concat());
+    h[..60]
+        .chunks(5)
+        .map(|c| {
+            let n = c.iter().fold(0u64, |n, &b| n << 8 | b as u64);
+            format!("{:05}", n % 100_000)
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// No 0/O or 1/I/L, so codes survive being read out loud.
+pub const CODE_CHARS: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+/// The part of an invite code the server checks; the rest is the inviter's key pin.
+pub const CODE_LEN: usize = 10;
+const PIN_LEN: usize = 25; // ~124 bits
+
+/// "abcde-fghjk" and "ABCDEFGHJK" are the same code.
+pub fn normalize_code(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// A hash of the inviter's key, carried in the invite code. The server never sees
+/// it, so it can't hand the new user a fake key for whoever invited them.
+pub fn key_pin(k: &Key) -> String {
+    let h = Sha256::digest([b"chatui-invite-pin-v1:".as_slice(), k].concat());
+    let mut n = u128::from_be_bytes(h[..16].try_into().unwrap());
+    (0..PIN_LEN)
+        .map(|_| {
+            let c = CODE_CHARS[(n % CODE_CHARS.len() as u128) as usize] as char;
+            n /= CODE_CHARS.len() as u128;
+            c
+        })
+        .collect()
+}
+
+/// The code to hand out: the server's code plus our key pin, in groups of 5.
+pub fn full_invite(server_code: &str, me: &Key) -> String {
+    let all = normalize_code(server_code) + &key_pin(me);
+    let groups: Vec<&str> = (0..all.len())
+        .step_by(5)
+        .map(|i| &all[i..(i + 5).min(all.len())])
+        .collect();
+    groups.join("-")
+}
+
+/// Split what someone typed into (code for the server, inviter's key pin).
+/// Older, short codes have no pin.
+pub fn split_invite(s: &str) -> (String, Option<String>) {
+    let mut c = normalize_code(s);
+    if c.len() == CODE_LEN + PIN_LEN {
+        let pin = c.split_off(CODE_LEN);
+        (c, Some(pin))
+    } else {
+        (c, None)
+    }
+}
+
+/// A logged-in connection.
+pub struct Login {
+    pub ws: ClientWs,
+    /// For setting the read timeout before handing `ws` to `pump`.
+    pub tcp: TcpStream,
+    /// Who invited us, if we just signed up.
+    pub inviter: String,
+    /// We run this relay: we can remove people.
+    pub admin: bool,
+    /// How many of our one-time prekeys the relay still holds.
+    pub prekeys: usize,
+}
+
 /// Connect and prove we own `sk`; a new username also needs an `invite` code.
-/// Returns the socket (logged in), a handle to its TCP stream (for setting the read
-/// timeout before handing it to `pump`), and who invited us if we just signed up.
-pub fn handshake(
-    server: &str,
-    user: &str,
-    sk: &SecretKey,
-    invite: &str,
-) -> Result<(ClientWs, TcpStream, String), String> {
-    let (url, addr) = endpoint(server);
+pub fn handshake(server: &str, user: &str, sk: &SecretKey, invite: &str) -> Result<Login, String> {
+    let (url, addr) = endpoint(server)?;
     // try every resolved address: .local names often resolve to IPv6 first
     let mut last = "bad server address".to_string();
     let mut tcp = None;
@@ -223,7 +319,13 @@ pub fn handshake(
     if ok.t != "ok" {
         return Err(ok.err);
     }
-    Ok((ws, ctl, ok.from))
+    Ok(Login {
+        ws,
+        tcp: ctl,
+        inviter: ok.from,
+        admin: ok.admin,
+        prekeys: ok.count,
+    })
 }
 
 pub fn home() -> PathBuf {
@@ -269,23 +371,27 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 const USAGE: &str = "usage:
-  chatui                 open the chat (first run asks for a username and server)
-  chatui serve [addr]    run a relay server (default [::]:6769)
-  chatui mcp             MCP server so an AI can design themes
-                         (claude mcp add chatui -- chatui mcp)";
+  chatui                         open the chat (first run asks for a username and server)
+  chatui serve [addr]            run a relay server (default [::]:6769)
+  chatui serve [addr] --admin U  ...and make user U its admin (can remove people)
+  chatui mcp                     MCP server so an AI can design themes
+                                 (claude mcp add chatui -- chatui mcp)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let serve = |addr: Option<&str>, admin| {
+        server::run(
+            addr.unwrap_or("[::]:6769"),
+            &home().join("server.json"),
+            admin,
+        )
+    };
     let res = match args.as_slice() {
-        ["serve"] => {
-            server::run("[::]:6769", &home().join("server.json"));
-            Ok(())
-        }
-        ["serve", addr] => {
-            server::run(addr, &home().join("server.json"));
-            Ok(())
-        }
+        ["serve"] => serve(None, None),
+        ["serve", "--admin", u] => serve(None, Some(*u)),
+        ["serve", addr] => serve(Some(*addr), None),
+        ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
         ["mcp"] => mcp::run(),
         [] => client::run(),
         _ => Err(USAGE.into()),
@@ -316,15 +422,33 @@ mod tests {
 
     #[test]
     fn endpoints() {
-        assert_eq!(
-            endpoint("chat.rebeja.co"),
-            ("wss://chat.rebeja.co".into(), "chat.rebeja.co:443".into())
+        let ok = |s: &str, url: &str, addr: &str| {
+            assert_eq!(endpoint(s), Ok((url.into(), addr.into())), "{s}")
+        };
+        ok(
+            "chat.rebeja.co",
+            "wss://chat.rebeja.co",
+            "chat.rebeja.co:443",
         );
-        assert_eq!(
-            endpoint("minpi.local:6769"),
-            ("ws://minpi.local:6769".into(), "minpi.local:6769".into())
+        // another port is still TLS: nothing leaves this machine unencrypted
+        ok(
+            "minpi.local:6769",
+            "wss://minpi.local:6769",
+            "minpi.local:6769",
         );
-        assert_eq!(endpoint("ws://h:1/x/"), ("ws://h:1/x".into(), "h:1".into()));
+        ok("wss://h:1/x/", "wss://h:1/x", "h:1");
+        ok("localhost:6769", "ws://localhost:6769", "localhost:6769");
+        ok("127.0.0.1:5", "ws://127.0.0.1:5", "127.0.0.1:5");
+        ok("ws://[::1]:5/", "ws://[::1]:5", "[::1]:5");
+        ok("ws://localhost", "ws://localhost", "localhost:80");
+        ok("[::1]", "ws://[::1]", "[::1]:80");
+        for s in [
+            "ws://minpi.local:6769",
+            "ws://chat.rebeja.co",
+            "ws://10.0.0.2:6769",
+        ] {
+            assert!(endpoint(s).unwrap_err().contains("unencrypted"), "{s}");
+        }
     }
 
     #[test]
@@ -343,8 +467,9 @@ mod tests {
             SecretKey::generate(&mut OsRng),
         );
         // the first account needs no invite, everyone after does
-        let (mut aw, _, by) = handshake(&addr, "alice", &a, "").unwrap();
-        assert_eq!(by, "");
+        let alice = handshake(&addr, "alice", &a, "").unwrap();
+        let mut aw = alice.ws;
+        assert_eq!((alice.inviter.as_str(), alice.admin), ("", true));
         assert_eq!(
             handshake(&addr, "bob", &b, "").err().unwrap(),
             "this server is invite only: ask a friend on chatui for a code"
@@ -359,9 +484,9 @@ mod tests {
             "that invite code is wrong, used or expired"
         );
         // codes are case- and dash-insensitive, and single use
-        let (mut bw, _, by) =
-            handshake(&addr, "bob", &b, &for_bob.to_lowercase().replace('-', "")).unwrap();
-        assert_eq!(by, "alice");
+        let bob = handshake(&addr, "bob", &b, &for_bob.to_lowercase().replace('-', "")).unwrap();
+        let mut bw = bob.ws;
+        assert_eq!((bob.inviter.as_str(), bob.admin), ("alice", false));
         assert!(handshake(&addr, "dave", &d, &for_bob).is_err());
         drop(handshake(&addr, "carol", &c, &for_carol).unwrap()); // register, then go offline
 
@@ -386,7 +511,7 @@ mod tests {
         let carol = c.public_key().to_bytes();
         send_pkt(&mut aw, "send", "carol", "2", seal(&carol, &a, b"yo"));
         assert_eq!(recv(&mut aw).unwrap().id, "2");
-        let (mut cw, _, _) = handshake(&addr, "carol", &c, "").unwrap();
+        let mut cw = handshake(&addr, "carol", &c, "").unwrap().ws;
         let m = recv(&mut cw).unwrap();
         assert_eq!(open(&m.key.unwrap(), &c, &m.data).unwrap(), b"yo");
 
@@ -402,10 +527,175 @@ mod tests {
         let k = recv(&mut aw).unwrap();
         assert_eq!((k.keys.get("bob"), k.keys.len()), (Some(&bob), 1));
 
-        // everything relayed is archived, encrypted
-        let archive = fs::read_to_string(dir.join("messages.jsonl")).unwrap();
-        assert_eq!(archive.lines().count(), 2);
-        assert!(!archive.contains("hi") && !archive.contains("yo"));
+        // nothing relayed is kept once it's delivered
+        assert!(!dir.join("messages.jsonl").exists());
+
+        // ciphertext over the size limit is refused, not relayed
+        send_pkt(&mut aw, "send", "bob", "3", vec![0; MAX_DATA + 1]);
+        assert_eq!(recv(&mut aw).unwrap().err, "message too big");
+
+        // an offline inbox is capped in bytes, not just messages
+        drop(cw);
+        std::thread::sleep(Duration::from_millis(300));
+        let mut last = Pkt::default();
+        for i in 0..200 {
+            send_pkt(&mut aw, "send", "carol", &i.to_string(), vec![0; MAX_DATA]);
+            last = recv(&mut aw).unwrap();
+            if last.t == "err" {
+                break;
+            }
+        }
+        assert_eq!(last.err, "carol's inbox is full");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invite_codes_and_safety_numbers() {
+        let (a, b) = (
+            SecretKey::generate(&mut OsRng).public_key().to_bytes(),
+            SecretKey::generate(&mut OsRng).public_key().to_bytes(),
+        );
+        let full = full_invite("7KQ2M-XH4PD", &a);
+        assert_eq!(full.len(), 35 + 6);
+        assert_eq!(
+            split_invite(&full.to_lowercase()),
+            ("7KQ2MXH4PD".into(), Some(key_pin(&a)))
+        );
+        assert_eq!(split_invite("7kq2m-xh4pd"), ("7KQ2MXH4PD".into(), None));
+        assert_ne!(key_pin(&a), key_pin(&b));
+        // the same for both people, different for every pair, 12 groups of 5 digits
+        let n = safety_number(&a, &b);
+        assert_eq!(n, safety_number(&b, &a));
+        assert_ne!(n, safety_number(&a, &a));
+        assert_eq!(n.split(' ').map(str::len).collect::<Vec<_>>(), [5; 12]);
+    }
+
+    #[test]
+    fn moderation() {
+        let dir = std::env::temp_dir().join(format!("chatui-mod-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("s.json");
+        let (a, b, c) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        // an older relay: no admin yet, bob's account is two days old
+        let old = chrono::Utc::now() - chrono::Duration::days(2);
+        let seed = serde_json::json!({
+            "users": {"alice": a.public_key().to_bytes(), "bob": b.public_key().to_bytes()},
+            "joined": {"bob": old},
+        });
+        fs::write(&state, seed.to_string()).unwrap();
+        assert!(server::run("127.0.0.1:0", &state, Some("nobody")).is_err());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let st = state.clone();
+        std::thread::spawn(move || server::serve(l, &st));
+        let login = |name, sk: &SecretKey, code: &str| handshake(&addr, name, sk, code);
+        let req = |ws: &mut ClientWs, t: &str, user: &str| {
+            let p = Pkt {
+                t: t.into(),
+                user: user.into(),
+                ..Default::default()
+            };
+            assert!(send(ws, &p));
+            recv(ws).unwrap()
+        };
+
+        // nobody is admin until the operator says so
+        let mut bw = login("bob", &b, "").unwrap().ws;
+        assert!(!login("alice", &a, "").unwrap().admin);
+        assert_eq!(
+            req(&mut bw, "ban", "alice").err,
+            "only the relay admin can remove people"
+        );
+
+        // regular members get 3 unused invites; a full code (with key pin) works too
+        let codes: Vec<String> = (0..3).map(|_| req(&mut bw, "invite", "").id).collect();
+        assert!(req(&mut bw, "invite", "").err.contains("3 unused invites"));
+        let full = full_invite(&codes[0], &b.public_key().to_bytes());
+        let carol = login("carol", &c, &full).unwrap();
+        assert_eq!(carol.inviter, "bob");
+        // ...and brand-new accounts have to wait a day
+        let mut cw = carol.ws;
+        assert!(req(&mut cw, "invite", "").err.contains("24 hours"));
+
+        // the operator makes alice admin (normally with `chatui serve --admin alice`)
+        drop((bw, cw)); // invites and sign-ups are saved right away
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = l.local_addr().unwrap().to_string();
+        let st = state.clone();
+        std::thread::spawn(move || {
+            server::run("x", &st, Some("alice")).unwrap_err(); // sets admin, then fails to bind
+            server::serve(l, &st)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let login = |name, sk: &SecretKey, code: &str| handshake(&addr2, name, sk, code);
+        let alice = login("alice", &a, "").unwrap();
+        assert!(alice.admin);
+        let mut aw = alice.ws;
+        let mut bw = login("bob", &b, "").unwrap().ws;
+
+        // removing bob logs him out, keeps him out, and voids his invites
+        let r = req(&mut aw, "ban", "bob");
+        assert_eq!(
+            (r.t.as_str(), r.users.as_slice()),
+            ("banned", ["bob".to_string()].as_slice())
+        );
+        let d = SecretKey::generate(&mut OsRng);
+        assert!(recv(&mut bw).is_none());
+        assert_eq!(
+            login("bob", &b, "").err().unwrap(),
+            "you were removed from this relay"
+        );
+        assert!(login("dave", &d, &codes[1]).is_err());
+        let p = Pkt {
+            t: "send".into(),
+            to: "bob".into(),
+            data: vec![1],
+            ..Default::default()
+        };
+        assert!(send(&mut aw, &p));
+        assert_eq!(
+            recv(&mut aw).unwrap().err,
+            "bob was removed from this relay"
+        );
+        let k = Pkt {
+            t: "keys".into(),
+            users: vec!["bob".into()],
+            ..Default::default()
+        };
+        assert!(send(&mut aw, &k));
+        assert!(recv(&mut aw).unwrap().keys.is_empty());
+        assert_eq!(req(&mut aw, "ban", "alice").err, "that's you");
+
+        // and he can be let back in
+        assert!(req(&mut aw, "unban", "bob").users.is_empty());
+        assert!(login("bob", &b, "").is_ok());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A client that never finishes logging in is cut off at the deadline,
+    /// even if it keeps sending a byte now and then.
+    #[test]
+    fn login_deadline() {
+        let dir = std::env::temp_dir().join(format!("chatui-slow-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let state = dir.join("s.json");
+        std::thread::spawn(move || server::serve(l, &state));
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let start = Instant::now();
+        let closed = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            c.write_all(b"G").and_then(|_| c.flush()).is_err()
+        });
+        let mut rest = vec![];
+        let eof = closed || c.read_to_end(&mut rest).is_ok();
+        assert!(eof && start.elapsed() < Duration::from_secs(4));
         fs::remove_dir_all(dir).ok();
     }
 }

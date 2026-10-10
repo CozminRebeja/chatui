@@ -1,5 +1,10 @@
-# Push a v* tag (or run by hand) to attach the .debs and chatui.exe to the
-# GitHub release and publish the apt repo to GitHub Pages (gh-pages branch).
+# Push a v* tag (or run by hand) to attach the .debs, chatui.exe and a signed
+# SHA256SUMS to the GitHub release, and publish the apt repo to GitHub Pages.
+#
+# Hardening: every action is pinned to a full commit SHA (a moved tag can't swap
+# in new code), and the jobs that compile, which run third-party build scripts,
+# only get a read-only token. Uploading and signing happen in `publish`, which
+# runs no build at all.
 name: release
 
 on:
@@ -8,20 +13,25 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   GH_REPO: ${{ github.repository }}
-  GH_TOKEN: ${{ github.token }}
 
 jobs:
   release:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
@@ -42,59 +52,74 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - run: cargo install cargo-deb --locked
+      - run: cargo install cargo-deb --locked --version 3.8.0
       # static musl binary, so one .deb runs on any Debian/Ubuntu release
-      - run: cargo deb --target ${{ matrix.target }} --output dist/
+      - run: cargo deb --locked --target ${{ matrix.target }} --output dist/
         env:
           # prefilled on the first-run screen, same as the Homebrew formula
           CHATUI_SERVER: chat.rebeja.co
-      - run: gh release upload "${{ needs.release.outputs.tag }}" dist/*.deb --clobber
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: dist/*.deb
+          if-no-files-found: error
 
   windows:
     needs: release
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - run: cargo build --release --locked
         env:
           CHATUI_SERVER: chat.rebeja.co
           # static CRT, so it runs without the Visual C++ redistributable
           RUSTFLAGS: -C target-feature=+crt-static
-      - run: gh release upload "${{ needs.release.outputs.tag }}" target/release/chatui.exe --clobber
-
-  # Opens the PR to microsoft/winget-pkgs. The first version has to be submitted
-  # by hand; after that set WINGET_TOKEN (classic PAT, public_repo scope).
-  winget:
-    needs: [release, windows]
-    runs-on: ubuntu-24.04
-    env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-    steps:
-      - if: env.WINGET_TOKEN != ''
-        uses: vedantmgoyal9/winget-releaser@v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          identifier: CozminRebeja.chatui
-          release-tag: ${{ needs.release.outputs.tag }}
-          installers-regex: '\.exe$'
-          token: ${{ secrets.WINGET_TOKEN }}
+          name: windows
+          path: target/release/chatui.exe
+          if-no-files-found: error
 
-  apt:
-    needs: [release, deb]
+  # Checksums signed with the apt key, so the .exe (which isn't code-signed) and
+  # the .debs can be checked against a key whose fingerprint is in the README.
+  publish:
+    needs: [release, deb, windows]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release.outputs.tag }}
     steps:
-      - run: gh release download "${{ needs.release.outputs.tag }}" -p '*.deb' -D repo
-      - name: Index and sign
-        working-directory: repo
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and signature
+        working-directory: dist
         env:
           APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
         run: |
           echo "$APT_GPG_KEY" | gpg --batch --import
+          sha256sum *.deb chatui.exe > SHA256SUMS
+          gpg --batch --yes --armor --detach-sign -o SHA256SUMS.asc SHA256SUMS
+          gh release upload "$TAG" *.deb chatui.exe SHA256SUMS SHA256SUMS.asc --clobber
+      - name: Index and sign the apt repo
+        run: |
+          mkdir repo && cp dist/*.deb repo/ && cd repo
           gpg --export > chatui.gpg
           apt-ftparchive packages . > Packages
           gzip -k9 Packages
@@ -109,5 +134,21 @@ jobs:
           git init -q -b gh-pages
           git add -A
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
-            commit -qm "apt repo ${{ needs.release.outputs.tag }}"
+            commit -qm "apt repo $TAG"
           git push -f "https://x-access-token:$GH_TOKEN@github.com/$GH_REPO.git" gh-pages
+
+  # Opens the PR to microsoft/winget-pkgs. The first version has to be submitted
+  # by hand; after that set WINGET_TOKEN (classic PAT, public_repo scope).
+  winget:
+    needs: [release, publish]
+    runs-on: ubuntu-24.04
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@a8fff44b123f115ce4c21543edf8b677376fc7e0 # v2, 2026-09-20
+        with:
+          identifier: CozminRebeja.chatui
+          release-tag: ${{ needs.release.outputs.tag }}
+          installers-regex: '\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}

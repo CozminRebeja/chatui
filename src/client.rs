@@ -1,9 +1,12 @@
+mod e2e;
 mod ui;
 
 use crate::theme;
+use crate::vault::Vault;
 use crate::*;
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
+use e2e::{Fail, Olm, PREKEYS};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
 };
@@ -19,11 +22,22 @@ struct Identity {
     secret: Key,
 }
 
-/// Local history and pinned contact keys. Plaintext on disk (0600).
+/// Local history and pinned contact keys. Encrypted on disk (see vault.rs).
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct Store {
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
+    /// Keys we compared in person (safety numbers) or got through an invite code.
+    verified: BTreeMap<String, Key>,
+    /// Key pins from an invite code, waiting for that person's key to arrive.
+    expect: BTreeMap<String, String>,
+}
+
+impl Store {
+    fn find_chat(&self, id: &str) -> Option<usize> {
+        self.chats.iter().position(|c| c.id == id)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,6 +49,10 @@ struct Chat {
     msgs: Vec<Msg>,
     #[serde(default)]
     created: DateTime<Utc>,
+    /// A group someone added us to that we haven't joined yet: we don't send
+    /// to it or read-receipt it until we do.
+    #[serde(default)]
+    pending: bool,
 }
 
 impl Chat {
@@ -46,6 +64,7 @@ impl Chat {
             group,
             msgs: vec![],
             created: Utc::now(),
+            pending: false,
         }
     }
     fn last_activity(&self) -> DateTime<Utc> {
@@ -81,6 +100,9 @@ struct Quote {
     id: String,
     from: String,
     text: String,
+    /// Not in our history, so who said it and what is only the sender's word.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unconfirmed: bool,
 }
 
 impl Quote {
@@ -89,15 +111,18 @@ impl Quote {
             id: m.id.clone(),
             from: m.from.clone(),
             text: m.text.chars().take(200).collect(),
+            unconfirmed: false,
         }
     }
 }
 
 /// What actually gets encrypted: a chat message, a read receipt or a group invite.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
 struct Payload {
     t: String,
+    /// Who it's for, so a message can't be passed off as meant for someone else.
+    to: String,
     chat: String, // group id, empty for DMs
     id: String,
     text: String,
@@ -128,7 +153,18 @@ struct App {
     server: String,
     sk: SecretKey,
     store: Store,
+    /// Ratchet state, in its own file (olm.json) so it can be saved after every
+    /// message: sending before saving could reuse a message key after a crash.
+    olm: Olm,
+    /// Payloads for people we're starting a session with, until their prekey arrives.
+    waiting: BTreeMap<String, Vec<(String, Payload)>>,
+    claiming: std::collections::BTreeSet<String>,
+    /// When we last restarted a session that stopped decrypting, per person.
+    renewed: BTreeMap<String, Instant>,
+    warned_old: std::collections::BTreeSet<String>,
+    vault: Vault,
     dir: PathBuf,
+    admin: bool, // we run the relay we're connected to
     sel: usize,
     conn: Option<Sender<Pkt>>, // to the connection thread
     generation: u64,
@@ -147,6 +183,19 @@ struct App {
     msel: Option<String>, // selected message (by id) in the message pane
     reply_to: Option<Quote>,
     theme_err: String, // last theme load error, so it's shown once
+}
+
+/// Longest message we send, so it stays well under the relay's size limit.
+const MAX_TEXT: usize = 4000;
+
+/// Group ids are "g" + 24 hex digits, longer than any username, so a group can
+/// never pose as (and swallow) a DM.
+fn valid_group_id(s: &str) -> bool {
+    s.len() == 25
+        && s.starts_with('g')
+        && s[1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn rand_id() -> String {
@@ -193,17 +242,30 @@ fn notice(text: String) -> Msg {
     }
 }
 
+fn load_store(dir: &Path, vault: &Vault) -> Result<Store, String> {
+    let mut store: Store = match vault.read(&dir.join("store.json"))? {
+        Some(b) => serde_json::from_slice(&b).map_err(|e| format!("store.json is corrupt: {e}"))?,
+        None => Store::default(),
+    };
+    // chatui always made "g" + 24 hex ids; anything else was planted through an
+    // older version's bug (a "group" named after a username, capturing that DM)
+    store.chats.retain(|c| !c.group || valid_group_id(&c.id));
+    Ok(store)
+}
+
 pub fn run() -> Result<(), String> {
     let dir = home();
-    let store = match fs::read(dir.join("store.json")) {
-        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("store.json is corrupt: {e}"))?,
-        Err(_) => Store::default(),
+    let vault = crate::vault::unlock(&dir)?;
+    let store = load_store(&dir, &vault)?;
+    let olm: Olm = match vault.read(&dir.join("olm.json"))? {
+        Some(b) => serde_json::from_slice(&b).map_err(|e| format!("olm.json is corrupt: {e}"))?,
+        None => Olm::default(),
     };
-    let id: Option<Identity> = match fs::read(dir.join("identity.json")) {
-        Ok(b) => {
+    let id: Option<Identity> = match vault.read(&dir.join("identity.json"))? {
+        Some(b) => {
             Some(serde_json::from_slice(&b).map_err(|e| format!("identity.json is corrupt: {e}"))?)
         }
-        Err(_) => None,
+        None => None,
     };
     let (tx, rx) = mpsc::channel();
     let setup = id.is_none().then(|| Setup {
@@ -227,7 +289,14 @@ pub fn run() -> Result<(), String> {
         server,
         sk,
         store,
+        olm,
+        waiting: BTreeMap::new(),
+        claiming: Default::default(),
+        renewed: BTreeMap::new(),
+        warned_old: Default::default(),
+        vault,
         dir,
+        admin: false,
         sel: 0,
         conn: None,
         generation: 0,
@@ -333,24 +402,44 @@ impl App {
         if let Some(i) = cur.and_then(|id| self.find(&id)) {
             self.sel = i;
         }
-        if let Err(e) = write_private(
-            &self.dir.join("store.json"),
-            &serde_json::to_vec(&self.store).unwrap(),
-        ) {
+        let plain = zeroize::Zeroizing::new(serde_json::to_vec(&self.store).unwrap());
+        if let Err(e) = self.vault.write(&self.dir.join("store.json"), &plain) {
             panic!("could not save chat history: {e}");
         }
     }
 
+    fn save_olm(&self) {
+        let plain = zeroize::Zeroizing::new(serde_json::to_vec(&self.olm).unwrap());
+        if let Err(e) = self.vault.write(&self.dir.join("olm.json"), &plain) {
+            panic!("could not save encryption state: {e}");
+        }
+    }
+
+    /// Top the relay back up to `PREKEYS` one-time prekeys.
+    fn publish_prekeys(&mut self, on_server: usize) {
+        let (otks, fallback) = self.olm.new_prekeys(&self.sk, on_server);
+        self.save_olm(); // before anyone can use them
+        let p = Pkt {
+            t: "prekeys".into(),
+            otks,
+            key: Some(fallback),
+            ..Default::default()
+        };
+        if self.write(&p) {
+            self.olm.published(&self.sk);
+            self.save_olm();
+        }
+    }
+
     fn save_identity(&self) -> io::Result<()> {
-        let id = Identity {
+        let mut id = Identity {
             user: self.me.clone(),
             server: self.server.clone(),
             secret: self.sk.to_bytes(),
         };
-        write_private(
-            &self.dir.join("identity.json"),
-            &serde_json::to_vec(&id).unwrap(),
-        )
+        let plain = zeroize::Zeroizing::new(serde_json::to_vec(&id).unwrap());
+        zeroize::Zeroize::zeroize(&mut id.secret);
+        self.vault.write(&self.dir.join("identity.json"), &plain)
     }
 
     /// Setup screen: register on the server first, only save the identity once it accepted us.
@@ -370,9 +459,11 @@ impl App {
             s.err = "enter the server address, e.g. chat.example.com".into();
             return;
         }
-        match handshake(&server, &user, &self.sk, &invite) {
+        // the server only gets its part of the code; the rest pins the inviter's key
+        let (code, pin) = split_invite(&invite);
+        match handshake(&server, &user, &self.sk, &code) {
             Err(e) => s.err = e,
-            Ok((w, r, inviter)) => {
+            Ok(login) => {
                 (self.me, self.server) = (user, server);
                 if let Err(e) = self.save_identity() {
                     if let Some(s) = &mut self.setup {
@@ -381,10 +472,24 @@ impl App {
                     return;
                 }
                 self.setup = None;
-                self.attach(w, r);
+                let inviter = login.inviter.clone();
+                if valid_name(&inviter) && inviter != self.me {
+                    if let Some(pin) = pin {
+                        self.store.expect.insert(inviter.clone(), pin);
+                    }
+                    self.commit();
+                }
+                self.attach(login);
                 if valid_name(&inviter) && inviter != self.me {
                     let _ = self.new_dm(&inviter);
-                    self.notify(format!("You're in! {inviter} invited you — say hi."), false);
+                    if self.store.expect.contains_key(&inviter) {
+                        self.notify(format!("You're in! {inviter} invited you — say hi."), false);
+                    } else {
+                        self.notify(
+                            format!("You're in! That code couldn't vouch for {inviter}'s key: compare safety numbers (i)."),
+                            true,
+                        );
+                    }
                 } else {
                     self.notify("You're in! Press v to invite your friends.", false);
                 }
@@ -394,7 +499,7 @@ impl App {
 
     fn connect(&mut self) {
         match handshake(&self.server, &self.me, &self.sk, "") {
-            Ok((w, r, _)) => self.attach(w, r),
+            Ok(login) => self.attach(login),
             Err(e) => self.notify(format!("offline ({e}), retrying…"), true),
         }
     }
@@ -405,7 +510,15 @@ impl App {
         self.connect();
     }
 
-    fn attach(&mut self, ws: ClientWs, tcp: TcpStream) {
+    fn attach(&mut self, login: Login) {
+        let Login {
+            ws,
+            tcp,
+            admin,
+            prekeys,
+            ..
+        } = login;
+        self.admin = admin;
         self.generation += 1;
         let (tx, g) = (self.tx.clone(), self.generation);
         let (out, rx) = mpsc::channel();
@@ -418,6 +531,16 @@ impl App {
         });
         self.conn = Some(out);
         self.notify(format!("connected to {}", self.server), false);
+        if prekeys < PREKEYS / 2 {
+            self.publish_prekeys(prekeys);
+        }
+        // sessions we were starting on the old connection
+        self.claiming.clear();
+        let users: Vec<String> = self.waiting.keys().cloned().collect();
+        if !users.is_empty() {
+            self.claim(users);
+        }
+        self.sync_keys();
         // resend whatever never reached the server; receivers drop duplicates by id
         for ci in 0..self.store.chats.len() {
             let pending: Vec<Msg> = self.store.chats[ci]
@@ -444,10 +567,33 @@ impl App {
     }
 
     fn send_to(&mut self, to: &str, id: &str, p: &Payload) -> bool {
-        let Some(key) = self.store.contacts.get(to) else {
+        let p = Payload {
+            to: to.into(),
+            ..p.clone()
+        };
+        self.send_payload(to, id, p)
+    }
+
+    /// Encrypt with our session with `to`, or start one first (see `on_claim`).
+    fn send_payload(&mut self, to: &str, id: &str, p: Payload) -> bool {
+        if !self.store.contacts.contains_key(to) {
+            return false;
+        }
+        if !self.olm.has_session(to) {
+            self.waiting
+                .entry(to.into())
+                .or_default()
+                .push((id.into(), p));
+            if !self.claiming.contains(to) {
+                self.claim(vec![to.into()]);
+            }
+            return self.conn.is_some();
+        }
+        let plain = zeroize::Zeroizing::new(serde_json::to_vec(&p).unwrap());
+        let Some(data) = self.olm.encrypt(to, &plain) else {
             return false;
         };
-        let data = seal(key, &self.sk, &serde_json::to_vec(p).unwrap());
+        self.save_olm();
         self.write(&Pkt {
             t: "send".into(),
             to: to.into(),
@@ -455,6 +601,72 @@ impl App {
             data,
             ..Default::default()
         })
+    }
+
+    /// Ask the relay for one prekey each, to start sessions with `users`.
+    fn claim(&mut self, users: Vec<String>) {
+        let p = Pkt {
+            t: "claim".into(),
+            users: users.clone(),
+            ..Default::default()
+        };
+        if self.write(&p) {
+            self.claiming.extend(users);
+        }
+    }
+
+    fn on_claim(&mut self, p: Pkt) {
+        for u in &p.users {
+            self.claiming.remove(u);
+            let waiting = self.waiting.remove(u).unwrap_or_default();
+            // their identity key is the one we pinned, never one from this reply
+            let started = match (p.keys.get(u), self.store.contacts.get(u)) {
+                (Some(prekey), Some(id)) => self.olm.start(&self.sk, u, id, prekey),
+                _ => false,
+            };
+            if !started {
+                if waiting.iter().any(|(_, p)| p.t != "ping") {
+                    self.notify(
+                        format!("{u} needs to update chatui before you can message them"),
+                        true,
+                    );
+                }
+                continue;
+            }
+            for (id, p) in waiting {
+                self.send_payload(u, &id, p);
+            }
+        }
+        self.save_olm();
+    }
+
+    /// A message from `u` wouldn't decrypt (lost state, or a replay): start a
+    /// fresh session and say hello on it, so they switch to it. Once an hour at most.
+    fn renew(&mut self, u: &str) {
+        if self
+            .renewed
+            .get(u)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3600))
+        {
+            return;
+        }
+        self.renewed.insert(u.into(), Instant::now());
+        self.notify(
+            format!("couldn't decrypt a message from {u}; starting a fresh session"),
+            true,
+        );
+        let ping = Payload {
+            t: "ping".into(),
+            to: u.into(),
+            ..Default::default()
+        };
+        self.waiting
+            .entry(u.into())
+            .or_default()
+            .push((String::new(), ping));
+        if !self.claiming.contains(u) {
+            self.claim(vec![u.into()]);
+        }
     }
 
     fn deliver(&mut self, ci: usize, m: &Msg) {
@@ -475,8 +687,21 @@ impl App {
     }
 
     fn send_text(&mut self, text: String) {
-        if self.sel >= self.store.chats.len() {
+        let Some(c) = self.store.chats.get(self.sel) else {
             return self.notify("start a chat first (n)", true);
+        };
+        if c.pending {
+            return self.notify(
+                format!("press y to join #{} first (d declines)", c.name),
+                true,
+            );
+        }
+        let n = text.chars().count();
+        if n > MAX_TEXT {
+            return self.notify(
+                format!("too long: {n} characters, {MAX_TEXT} at most"),
+                true,
+            );
         }
         let m = Msg {
             id: rand_id(),
@@ -499,6 +724,9 @@ impl App {
             return;
         }
         let c = &self.store.chats[self.sel];
+        if c.pending {
+            return;
+        }
         let chat = if c.group { c.id.clone() } else { String::new() };
         let mut by_sender: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for m in c
@@ -535,7 +763,7 @@ impl App {
     }
 
     fn find(&self, id: &str) -> Option<usize> {
-        self.store.chats.iter().position(|c| c.id == id)
+        self.store.find_chat(id)
     }
 
     fn add_chat(&mut self, c: Chat) -> usize {
@@ -582,6 +810,9 @@ impl App {
         let Some(c) = self.find(chat).map(|i| &self.store.chats[i]) else {
             return Err("that group is gone".into());
         };
+        if c.pending {
+            return Err("join the group first (y)".into());
+        }
         let users: Vec<String> = users
             .into_iter()
             .filter(|u| !c.members.contains(u))
@@ -624,6 +855,9 @@ impl App {
         let Some(c) = self.store.chats.get(self.sel).filter(|c| c.group) else {
             return Err("that group is gone".into());
         };
+        if c.pending {
+            return Err("join the group first (y)".into());
+        }
         if c.name == name {
             return Ok(());
         }
@@ -645,6 +879,41 @@ impl App {
             .push(notice(format!("you renamed the group to {name}")));
         self.commit();
         Ok(())
+    }
+
+    /// Accept the invite to group `ci`.
+    fn join_group(&mut self, ci: usize) {
+        let Some(c) = self.store.chats.get_mut(ci).filter(|c| c.pending) else {
+            return;
+        };
+        c.pending = false;
+        c.msgs.push(notice("you joined".into()));
+        self.commit();
+    }
+
+    /// Fetch, from the server, the key of every chat member we don't have one for.
+    /// Keys are never taken from other people's messages: a group invite could
+    /// otherwise plant a fake key for someone we haven't talked to yet.
+    fn sync_keys(&mut self) {
+        let mut users: Vec<String> = self
+            .store
+            .chats
+            .iter()
+            .flat_map(|c| &c.members)
+            .filter(|u| !self.store.contacts.contains_key(*u))
+            .cloned()
+            .collect();
+        users.sort();
+        users.dedup();
+        if !users.is_empty() {
+            // `to: "sync"` marks the lookup as background, see on_keys
+            self.write(&Pkt {
+                t: "keys".into(),
+                to: "sync".into(),
+                users,
+                ..Default::default()
+            });
+        }
     }
 
     fn create_invite(&mut self) {
@@ -683,19 +952,103 @@ impl App {
                 Some(Popup::Invite { code }) if code.is_empty() => {
                     *code = format!("error: {}", p.err)
                 }
+                Some(Popup::Admin { err, .. }) => *err = p.err,
                 _ => self.notify(format!("server: {}", p.err), true),
             },
-            "invite" => match &mut self.popup {
-                Some(Popup::Invite { code }) => *code = p.id,
-                _ => self.notify(format!("invite code: {}", p.id), false),
-            },
+            "invite" => {
+                let full = full_invite(&p.id, &self.sk.public_key().to_bytes());
+                match &mut self.popup {
+                    Some(Popup::Invite { code }) => *code = full,
+                    _ => self.notify(format!("invite code: {full}"), false),
+                }
+            }
+            "banned" => {
+                let what = match p.id.as_str() {
+                    "ban" => format!("{} can't use this relay any more", p.user),
+                    "unban" => format!("{} can use this relay again", p.user),
+                    _ => String::new(),
+                };
+                if let Some(Popup::Admin { banned, .. }) = &mut self.popup {
+                    *banned = p.users;
+                }
+                if !what.is_empty() {
+                    self.notify(what, false);
+                }
+            }
             "keys" => self.on_keys(p),
+            "claim" => self.on_claim(p),
+            "prekeys" if p.count < PREKEYS / 2 => self.publish_prekeys(p.count),
             "msg" => self.on_msg(p),
             _ => {}
         }
     }
 
+    /// May `k` be `u`'s key? Not if we already have another one pinned, or an
+    /// invite code vouched for a different one.
+    fn check_key(&self, u: &str, k: &Key) -> Result<(), String> {
+        match (self.store.contacts.get(u), self.store.expect.get(u)) {
+            (Some(old), _) if old != k => Err(format!(
+                "⚠ the server gave a different key for {u} than before — refusing it"
+            )),
+            (None, Some(pin)) if *pin != key_pin(k) => Err(format!(
+                "⚠ the server's key for {u} doesn't match your invite code — someone may be \
+                 listening in. Refusing it."
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Pin a key that passed `check_key`; one an invite code vouched for counts as verified.
+    fn pin_key(&mut self, u: &str, k: Key) {
+        if self.store.expect.remove(u).is_some() {
+            self.store.verified.insert(u.into(), k);
+        }
+        self.store.contacts.entry(u.into()).or_insert(k);
+    }
+
+    fn verified(&self, u: &str) -> bool {
+        self.store
+            .verified
+            .get(u)
+            .is_some_and(|k| self.store.contacts.get(u) == Some(k))
+    }
+
+    /// After comparing safety numbers: mark `u` verified, or not any more.
+    fn toggle_verified(&mut self, u: &str) {
+        if self.verified(u) {
+            self.store.verified.remove(u);
+        } else if let Some(k) = self.store.contacts.get(u) {
+            self.store.verified.insert(u.into(), *k);
+        }
+        self.commit();
+    }
+
+    /// Admin only: remove `user` from the relay (or let them back); empty just lists.
+    fn moderate(&mut self, ban: bool, user: &str) -> Result<(), String> {
+        if !user.is_empty() && !valid_name(user) {
+            return Err("usernames are 1-20 characters: a-z 0-9 _ -".into());
+        }
+        if self.write(&Pkt {
+            t: if ban { "ban" } else { "unban" }.into(),
+            user: user.into(),
+            ..Default::default()
+        }) {
+            Ok(())
+        } else {
+            Err("offline — try again when connected".into())
+        }
+    }
+
     fn on_keys(&mut self, p: Pkt) {
+        if p.to == "sync" {
+            for (u, k) in p.keys {
+                match self.check_key(&u, &k) {
+                    Ok(()) => self.pin_key(&u, k),
+                    Err(e) => self.notify(e, true),
+                }
+            }
+            return self.commit();
+        }
         let missing: Vec<&str> = p
             .users
             .iter()
@@ -708,17 +1061,12 @@ impl App {
                 missing.join(", ")
             ));
         }
-        if let Some(u) = p
-            .keys
-            .iter()
-            .find(|(u, k)| self.store.contacts.get(*u).is_some_and(|old| old != *k))
-            .map(|(u, _)| u)
-        {
-            return self.popup_error(format!(
-                "⚠ server returned a different key for {u} than before — refusing"
-            ));
+        if let Some(e) = p.keys.iter().find_map(|(u, k)| self.check_key(u, k).err()) {
+            return self.popup_error(e);
         }
-        self.store.contacts.extend(p.keys.clone());
+        for (u, k) in &p.keys {
+            self.pin_key(u, *k);
+        }
         let ci = if !p.id.is_empty() {
             let Some(ci) = self.find(&p.id) else { return };
             self.grow_group(ci, &p.users);
@@ -808,18 +1156,42 @@ impl App {
         if !valid_name(&from) {
             return;
         }
-        if self.store.contacts.get(&from).is_some_and(|k| *k != key) {
-            return self.notify(
-                format!("⚠ message claiming to be from {from} had a different key — dropped"),
-                true,
-            );
+        if let Err(e) = self.check_key(&from, &key) {
+            return self.notify(format!("{e} (a message from {from} was dropped)"), true);
         }
-        let Some(m) =
-            open(&key, &self.sk, &p.data).and_then(|b| serde_json::from_slice::<Payload>(&b).ok())
-        else {
+        let plain = match self.olm.decrypt(&self.sk, &from, &key, &p.data) {
+            Ok(b) => zeroize::Zeroizing::new(b),
+            Err(Fail::Old) => {
+                if self.warned_old.insert(from.clone()) {
+                    self.notify(
+                        format!("{from} is on an older chatui; their messages can't be read until they update"),
+                        true,
+                    );
+                }
+                return;
+            }
+            Err(Fail::Undecryptable) => return self.renew(&from),
+        };
+        self.save_olm();
+        if self.olm.take_new_session() {
+            // one of our prekeys was used up: ask how many are left
+            self.write(&Pkt {
+                t: "prekeys".into(),
+                ..Default::default()
+            });
+        }
+        let Ok(m) = serde_json::from_slice::<Payload>(&plain) else {
             return;
         };
-        self.store.contacts.entry(from.clone()).or_insert(key);
+        // meant for someone else (only chatui before 0.9 left it out, and
+        // those can't send ratchet messages)
+        if m.to != self.me {
+            return;
+        }
+        self.pin_key(&from, key);
+        if !m.chat.is_empty() && !valid_group_id(&m.chat) {
+            return;
+        }
         let chat_id = if m.chat.is_empty() {
             from.clone()
         } else {
@@ -842,16 +1214,20 @@ impl App {
                     return;
                 }
                 let text = clean(&m.text);
-                // trust our own copy of the quoted message over the sender's
+                // trust our own copy of the quoted message over the sender's; one
+                // we don't have is shown as the sender's claim, not as a fact
                 let reply = m.reply.filter(|q| valid_name(&q.from)).map(|q| {
                     c.msgs.iter().find(|x| x.id == q.id).map_or(
                         Quote {
                             text: clean(&q.text).chars().take(200).collect(),
+                            unconfirmed: true,
                             ..q
                         },
                         Quote::of,
                     )
                 });
+                // a sender can't post into the future (and sort to the bottom forever)
+                let ts = m.ts.min(Utc::now());
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -864,7 +1240,7 @@ impl App {
                     id: m.id,
                     from,
                     text,
-                    ts: m.ts,
+                    ts,
                     status: Status::Pending,
                     read_by: vec![],
                     reply,
@@ -883,6 +1259,9 @@ impl App {
                     return;
                 };
                 let c = &mut self.store.chats[ci];
+                if !c.members.contains(&from) {
+                    return;
+                }
                 let n = c.members.len();
                 for x in c
                     .msgs
@@ -898,18 +1277,13 @@ impl App {
                 }
             }
             "group" => {
-                if self.find(&m.chat).is_some()
-                    || !m.chat.starts_with('g')
+                if m.chat.is_empty()
+                    || self.find(&m.chat).is_some()
                     || !m.members.contains_key(&self.me)
+                    || !m.members.contains_key(&from)
                     || !m.members.keys().all(|u| valid_name(u))
                 {
                     return;
-                }
-                for (u, k) in &m.members {
-                    if *u != self.me {
-                        // first-seen key wins; a conflicting one would just fail to decrypt later
-                        self.store.contacts.entry(u.clone()).or_insert(*k);
-                    }
                 }
                 let members = m
                     .members
@@ -917,10 +1291,20 @@ impl App {
                     .filter(|u| **u != self.me)
                     .cloned()
                     .collect();
-                let mut c = Chat::new(m.chat, clean(&m.name), members, true);
-                c.msgs.push(notice(format!("{from} added you")));
+                let mut name: String = clean(m.name.trim()).chars().take(40).collect();
+                if name.is_empty() {
+                    name = "group".into();
+                }
+                let mut c = Chat::new(m.chat, name, members, true);
+                c.pending = true;
+                c.msgs
+                    .push(notice(format!("{from} added you · y joins, d declines")));
                 self.add_chat(c);
-                self.notify(format!("{from} added you to a group"), false);
+                self.notify(
+                    format!("{from} added you to a group — open it to join"),
+                    false,
+                );
+                self.sync_keys();
             }
             "rename" => {
                 let Some(ci) = self.find(&m.chat) else { return };
@@ -953,13 +1337,11 @@ impl App {
                 if new.is_empty() {
                     return;
                 }
-                for u in &new {
-                    self.store.contacts.entry(u.clone()).or_insert(m.members[u]);
-                }
                 let c = &mut self.store.chats[ci];
                 c.members.extend(new.iter().cloned());
                 c.msgs
                     .push(notice(format!("{from} added {}", new.join(", "))));
+                self.sync_keys();
             }
             _ => return,
         }
@@ -982,7 +1364,7 @@ mod tests {
     }
 
     fn app(server: &str, me: &str, invite: &str) -> (App, Receiver<Ev>) {
-        let dir = std::env::temp_dir().join(format!("chatui-app-{}-{me}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatui-app-{me}-{}", rand_id()));
         fs::create_dir_all(&dir).unwrap();
         let (tx, rx) = mpsc::channel();
         let mut a = App {
@@ -990,7 +1372,14 @@ mod tests {
             server: server.into(),
             sk: SecretKey::generate(&mut OsRng),
             store: Store::default(),
+            olm: Olm::default(),
+            waiting: BTreeMap::new(),
+            claiming: Default::default(),
+            renewed: BTreeMap::new(),
+            warned_old: Default::default(),
+            vault: Vault::random(),
             dir,
+            admin: false,
             sel: 0,
             conn: None,
             generation: 0,
@@ -1009,8 +1398,12 @@ mod tests {
             reply_to: None,
             theme_err: String::new(),
         };
-        let (w, r, _) = handshake(server, me, &a.sk, invite).unwrap();
-        a.attach(w, r);
+        let (code, pin) = split_invite(invite);
+        let login = handshake(server, me, &a.sk, &code).unwrap();
+        if let Some(pin) = pin {
+            a.store.expect.insert(login.inviter.clone(), pin);
+        }
+        a.attach(login);
         (a, rx)
     }
 
@@ -1047,6 +1440,359 @@ mod tests {
         a.store.chats.iter().find(|c| c.group)
     }
 
+    /// Wait for the invite to group `gid`, join it, and wait for everyone's keys.
+    fn join(a: &mut App, rx: &Receiver<Ev>, gid: &str) {
+        until(a, rx, |a| a.find(gid).is_some());
+        let ci = a.find(gid).unwrap();
+        assert!(a.store.chats[ci].pending);
+        a.join_group(ci);
+        until(a, rx, |a| {
+            let c = &a.store.chats[a.find(gid).unwrap()];
+            c.members.iter().all(|u| a.store.contacts.contains_key(u))
+        });
+    }
+
+    fn relay() -> (String, PathBuf) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let state = std::env::temp_dir().join(format!(
+            "chatui-relay-{}-{}.json",
+            std::process::id(),
+            rand_id()
+        ));
+        let st = state.clone();
+        std::thread::spawn(move || server::serve(l, &st));
+        (addr, state)
+    }
+
+    fn pk(a: &App) -> Key {
+        a.sk.public_key().to_bytes()
+    }
+
+    /// Let `a` finish starting sessions (claiming prekeys) and send what was waiting.
+    fn settle(a: &mut App, rx: &Receiver<Ev>) {
+        until(a, rx, |a| a.waiting.is_empty() && a.claiming.is_empty());
+    }
+
+    /// Hand-craft a payload from `a` to `to`, as a modified client could.
+    fn forge(a: &mut App, rx: &Receiver<Ev>, to: &App, p: Payload) {
+        a.store.contacts.insert(to.me.clone(), pk(to));
+        assert!(a.send_to(&to.me, "", &p));
+        settle(a, rx);
+    }
+
+    /// The invite code carries a hash of the inviter's key, so the new user's first
+    /// contact can't be swapped by the relay, and starts out verified.
+    #[test]
+    fn invite_code_vouches_for_inviter() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        assert_eq!(normalize_code(&code).len(), CODE_LEN + 25);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        bob.new_dm("alice").unwrap();
+        until(&mut bob, &rb, |a| a.find("alice").is_some());
+        assert!(bob.verified("alice") && bob.store.expect.is_empty());
+
+        // a code whose pin doesn't match the key the relay hands out: refused
+        let code = invite(&mut alice, &ra);
+        let (server_part, _) = split_invite(&code);
+        let wrong = full_invite(&server_part, &pk(&bob));
+        let (mut carol, rc) = app(&addr, "carol", &wrong);
+        carol.new_dm("alice").unwrap();
+        until(&mut carol, &rc, |a| {
+            a.toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("doesn't match"))
+        });
+        assert!(carol.find("alice").is_none() && !carol.store.contacts.contains_key("alice"));
+        // ...including when the inviter writes first
+        alice.store.contacts.insert("carol".into(), pk(&carol));
+        alice.add_chat(Chat::new(
+            "carol".into(),
+            "carol".into(),
+            vec!["carol".into()],
+            false,
+        ));
+        alice.sel = alice.find("carol").unwrap();
+        alice.send_text("welcome!".into());
+        settle(&mut alice, &ra);
+        carol.toast = None;
+        until(&mut carol, &rc, |a| {
+            a.toast.as_ref().is_some_and(|t| t.0.contains("dropped"))
+        });
+        assert!(carol.find("alice").is_none());
+
+        // comparing safety numbers by hand: m marks verified, and back
+        bob.store.contacts.remove("alice");
+        bob.store.verified.clear();
+        bob.store.contacts.insert("alice".into(), pk(&alice));
+        bob.toggle_verified("alice");
+        assert!(bob.verified("alice"));
+        bob.toggle_verified("alice");
+        assert!(!bob.verified("alice"));
+        for a in [&alice, &bob, &carol] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// Every message goes through a ratchet session started from a prekey; a
+    /// session that breaks (say, restored from an old backup) heals itself;
+    /// older clients are named, not silently dropped.
+    #[test]
+    fn sessions_start_heal_and_spot_old_clients() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        // logging in published a full set of prekeys
+        std::thread::sleep(Duration::from_millis(200));
+        let login = handshake(&addr, "bob", &bob.sk, "").unwrap();
+        assert_eq!(login.prekeys, PREKEYS);
+        bob.attach(login);
+        alice.store.contacts.insert("bob".into(), pk(&bob));
+        alice.add_chat(Chat::new(
+            "bob".into(),
+            "bob".into(),
+            vec!["bob".into()],
+            false,
+        ));
+        alice.sel = alice.find("bob").unwrap();
+        let said = |a: &App, t: &str| {
+            a.find("alice")
+                .is_some_and(|i| a.store.chats[i].msgs.iter().any(|m| m.text == t))
+        };
+        alice.send_text("one".into());
+        settle(&mut alice, &ra);
+        assert!(alice.olm.has_session("bob"));
+        until(&mut bob, &rb, |a| said(a, "one"));
+
+        // bob loses his session state: alice's next message can't be read, so
+        // bob starts a fresh session, and the one after that gets through
+        bob.olm = Olm::default();
+        alice.send_text("lost".into());
+        until(&mut bob, &rb, |a| {
+            a.toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("fresh session"))
+        });
+        settle(&mut bob, &rb);
+        until(&mut alice, &ra, |a| a.olm.sessions_with("bob") == 2);
+        alice.send_text("healed".into());
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| said(a, "healed"));
+        assert!(!said(&bob, "lost"));
+
+        // a pre-0.9 client sends plain boxes: named, not shown
+        let old = seal(&pk(&bob), &alice.sk, b"{\"t\":\"msg\"}");
+        alice.write(&Pkt {
+            t: "send".into(),
+            to: "bob".into(),
+            data: old,
+            ..Default::default()
+        });
+        until(&mut bob, &rb, |a| {
+            a.toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("older chatui"))
+        });
+        for a in [&alice, &bob] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// Payloads a peer (or a relay) could forge: bounced-back messages, read
+    /// receipts from outsiders, messages from the future, made-up quotes.
+    #[test]
+    fn forged_payloads_are_ignored() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut mallory, rm) = app(&addr, "mallory", &code);
+        bob.store.contacts.insert("alice".into(), pk(&alice));
+        bob.add_chat(Chat::new(
+            "alice".into(),
+            "alice".into(),
+            vec!["alice".into()],
+            false,
+        ));
+        let dm = |a: &App| {
+            a.find("bob")
+                .map(|i| a.store.chats[i].msgs.clone())
+                .unwrap_or_default()
+        };
+
+        // addressed to someone else (as if the relay bounced it): dropped
+        let msg = |id: &str, to: &str| Payload {
+            t: "msg".into(),
+            to: to.into(),
+            id: id.into(),
+            text: id.into(),
+            ts: Utc::now(),
+            ..Default::default()
+        };
+        bob.send_payload("alice", "", msg("bounced", "carol"));
+        settle(&mut bob, &rb);
+        // from the future: pulled back to now
+        let mut p = msg("future", "alice");
+        p.ts = Utc::now() + chrono::Duration::days(365);
+        p.reply = Some(Quote {
+            id: "nope".into(),
+            from: "alice".into(),
+            text: "I owe bob $500".into(),
+            unconfirmed: false,
+        });
+        bob.send_to("alice", "", &p);
+        settle(&mut bob, &rb);
+        until(&mut alice, &ra, |a| dm(a).iter().any(|m| m.id == "future"));
+        let msgs = dm(&alice);
+        assert!(msgs.iter().all(|m| m.id != "bounced"));
+        let f = msgs.iter().find(|m| m.id == "future").unwrap();
+        assert!(f.ts <= Utc::now());
+        assert!(f.reply.as_ref().unwrap().unconfirmed);
+
+        // a read receipt for a group from someone not in it changes nothing
+        let gid = format!("g{}", rand_id());
+        alice.add_chat(Chat::new(gid.clone(), "g".into(), vec!["bob".into()], true));
+        alice.sel = alice.find(&gid).unwrap();
+        alice.send_text("hi bob".into());
+        settle(&mut alice, &ra);
+        let group_msg = |a: &App| a.store.chats[a.find(&gid).unwrap()].msgs[0].clone();
+        let fake = Payload {
+            t: "read".into(),
+            chat: gid.clone(),
+            ids: vec![group_msg(&alice).id],
+            ..Default::default()
+        };
+        forge(&mut mallory, &rm, &alice, fake);
+        let p = msg("marker", "alice"); // processed after the receipt
+        forge(&mut mallory, &rm, &alice, p);
+        until(&mut alice, &ra, |a| a.find("mallory").is_some());
+        let m = group_msg(&alice);
+        assert!(m.read_by.is_empty() && m.status != Status::Read);
+        drop(rb);
+        for a in [&alice, &bob, &mallory] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// Regression: a "group" whose id was a username used to replace the DM with
+    /// that user, so the inviter got a copy of everything sent there.
+    #[test]
+    fn group_cannot_pose_as_a_dm() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut mallory, rm) = app(&addr, "mallory", &code);
+        let code = invite(&mut alice, &ra);
+        let (gary, _rg) = app(&addr, "gary", &code);
+
+        let members = [
+            ("alice", pk(&alice)),
+            ("gary", pk(&gary)),
+            ("mallory", pk(&mallory)),
+        ];
+        let planted = Payload {
+            t: "group".into(),
+            chat: "gary".into(),
+            name: "gary".into(),
+            members: members.map(|(u, k)| (u.to_string(), k)).into(),
+            ..Default::default()
+        };
+        forge(&mut mallory, &rm, &alice, planted);
+        // a real group invite sent right after, so we know the first one was processed
+        let gid = format!("g{}", rand_id());
+        let real = Payload {
+            t: "group".into(),
+            chat: gid.clone(),
+            name: "x".into(),
+            members: members.map(|(u, k)| (u.to_string(), k)).into(),
+            ..Default::default()
+        };
+        forge(&mut mallory, &rm, &alice, real);
+        until(&mut alice, &ra, |a| a.find(&gid).is_some());
+        assert!(alice.find("gary").is_none());
+
+        // and an old store holding such a chat drops it on load
+        let mut bad = Chat::new("gary".into(), "gary".into(), vec!["mallory".into()], true);
+        bad.msgs.push(notice("x".into()));
+        alice.store.chats.push(bad);
+        alice.commit();
+        let st = load_store(&alice.dir, &alice.vault).unwrap();
+        assert!(st.find_chat("gary").is_none() && st.find_chat(&gid).is_some());
+        assert!(valid_group_id(&gid) && !valid_group_id("gary") && !valid_group_id("gABCDEF"));
+
+        for a in [&alice, &mallory, &gary] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// Regression: group invites used to plant member keys in our contacts, so an
+    /// inviter could swap in their own key for someone we hadn't talked to yet.
+    /// Keys now come from the server only. Being added also asks first.
+    #[test]
+    fn invites_cant_plant_keys_and_need_consent() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut mallory, rm) = app(&addr, "mallory", &code);
+        let code = invite(&mut alice, &ra);
+        let (gary, _rg) = app(&addr, "gary", &code);
+
+        let gid = format!("g{}", rand_id());
+        let mut members: BTreeMap<String, Key> = BTreeMap::new();
+        members.insert("alice".into(), pk(&alice));
+        members.insert("mallory".into(), pk(&mallory));
+        members.insert("gary".into(), pk(&mallory)); // lie about gary's key
+        let p = Payload {
+            t: "group".into(),
+            chat: gid.clone(),
+            name: "trap".into(),
+            members,
+            ..Default::default()
+        };
+        forge(&mut mallory, &rm, &alice, p);
+        until(&mut alice, &ra, |a| a.store.contacts.contains_key("gary"));
+        assert_eq!(alice.store.contacts["gary"], pk(&gary));
+
+        // not joined yet: nothing goes out
+        alice.sel = alice.find(&gid).unwrap();
+        fn chat<'a>(a: &'a App, gid: &str) -> &'a Chat {
+            &a.store.chats[a.find(gid).unwrap()]
+        }
+        assert!(chat(&alice, &gid).pending);
+        alice.send_text("hello?".into());
+        assert!(chat(&alice, &gid).msgs.iter().all(|m| m.from != "alice"));
+        assert!(alice.add_members(&gid, vec!["bob".into()]).is_err());
+        assert!(alice.rename_group("mine").is_err());
+        press(&mut alice, KeyCode::Char('y'));
+        assert!(!chat(&alice, &gid).pending);
+        let n = chat(&alice, &gid).msgs.len();
+        alice.send_text("x".repeat(MAX_TEXT + 1));
+        assert_eq!(chat(&alice, &gid).msgs.len(), n);
+
+        // joined: messages flow
+        let both = vec!["alice".into(), "gary".into()];
+        mallory.add_chat(Chat::new(gid.clone(), "trap".into(), both, true));
+        alice.send_text("hi all".into());
+        settle(&mut alice, &ra);
+        until(&mut mallory, &rm, |a| {
+            a.find(&gid)
+                .is_some_and(|i| a.store.chats[i].msgs.iter().any(|m| m.text == "hi all"))
+        });
+
+        for a in [&alice, &mallory, &gary] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
     #[test]
     fn add_to_group_and_mention() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1060,16 +1806,17 @@ mod tests {
         let (mut bob, rb) = app(&addr, "bob", &code);
         let code = invite(&mut alice, &ra);
         let (mut carol, rc) = app(&addr, "carol", &code);
-        let code = invite(&mut bob, &rb); // anyone who's in can invite
+        let code = invite(&mut alice, &ra); // (bob's account is too new to invite)
         let (mut dave, rd) = app(&addr, "dave", &code);
 
         alice
             .new_group("trip", vec!["bob".into(), "carol".into()])
             .unwrap();
         until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
         let gid = group(&alice).unwrap().id.clone();
-        until(&mut bob, &rb, |a| group(a).is_some());
-        until(&mut carol, &rc, |a| group(a).is_some());
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
 
         // carol adds dave, who wasn't in it
         assert!(carol.add_members(&gid, vec!["bob".into()]).is_err());
@@ -1077,7 +1824,8 @@ mod tests {
         until(&mut carol, &rc, |a| {
             group(a).unwrap().members.contains(&"dave".into())
         });
-        until(&mut dave, &rd, |a| group(a).is_some());
+        settle(&mut carol, &rc);
+        join(&mut dave, &rd, &gid);
         let mut m = group(&dave).unwrap().members.clone();
         m.sort();
         assert_eq!(m, ["alice", "bob", "carol"]);
@@ -1095,6 +1843,7 @@ mod tests {
         // the new member's messages are accepted, and the mention pings bob
         dave.sel = dave.find(&gid).unwrap();
         dave.send_text("hey @bob".into());
+        settle(&mut dave, &rd);
         until(&mut bob, &rb, |a| {
             group(a).unwrap().msgs.iter().any(|m| m.from == "dave")
         });
@@ -1112,6 +1861,7 @@ mod tests {
         press(&mut bob, KeyCode::Char('r'));
         assert!(bob.focus == Focus::Input && bob.reply_to.is_some());
         bob.send_text("on my way".into());
+        settle(&mut bob, &rb);
         until(&mut alice, &ra, |a| {
             group(a).unwrap().msgs.iter().any(|m| m.from == "bob")
         });
@@ -1128,13 +1878,15 @@ mod tests {
             Some(Quote {
                 id: daves,
                 from: "dave".into(),
-                text: "hey @bob".into()
+                text: "hey @bob".into(),
+                unconfirmed: false,
             })
         );
 
         // any member can rename the group, everyone follows
         assert!(bob.rename_group("  ").is_err());
         bob.rename_group("road trip").unwrap();
+        settle(&mut bob, &rb);
         for (a, r) in [(&mut alice, &ra), (&mut dave, &rd)] {
             until(a, r, |a| group(a).unwrap().name == "road trip");
             let last = &group(a).unwrap().msgs.last().unwrap().text;

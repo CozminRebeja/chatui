@@ -1,110 +1,219 @@
 use crate::*;
+use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use tungstenite::WebSocket;
 
 const MAX_QUEUE: usize = 5000;
-const MAX_INVITES: usize = 10; // unused ones per person
+const MAX_INBOX_BYTES: usize = 8 << 20; // ciphertext waiting for one offline user
+const MAX_CONNS: usize = 512;
+const MAX_LOGINS: usize = 64; // connections that haven't logged in yet
+const MAX_KEYS: usize = 256; // users per key lookup
+const MAX_PREKEYS: usize = 50; // one-time prekeys held per user
+/// The whole login, not each read: a client dripping bytes can't hold a slot forever.
+const LOGIN: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+const MAX_INVITES: usize = 3; // unused ones per person
+const MAX_ADMIN_INVITES: usize = 50;
 const INVITE_DAYS: i64 = 7;
-/// No 0/O or 1/I/L, so codes survive being read out loud.
-const CODE_CHARS: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+/// New accounts wait this long before inviting, so one leaked invite can't
+/// snowball into a crowd of accounts before anyone notices.
+const NEW_ACCOUNT_HOURS: i64 = 24;
 
-/// Persisted: who owns which name, messages waiting for offline users, and
-/// unused invite codes. The server only ever sees ciphertext.
+/// Persisted: who owns which name, messages waiting for offline users, unused
+/// invite codes, and who runs the place. The server only ever sees ciphertext.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct State {
     users: HashMap<String, Key>,
     queue: HashMap<String, Vec<Pkt>>,
     invites: HashMap<String, Invite>,
+    /// Can remove people. The first account, or set with `chatui serve --admin`.
+    admin: String,
+    /// Removed: can't log in, can't be messaged, their name stays taken.
+    banned: BTreeSet<String>,
+    /// When each account signed up (missing for ones older than this field).
+    joined: HashMap<String, DateTime<Utc>>,
+    /// Public one-time prekeys, each handed out once, so others can start an
+    /// encrypted session with someone who's offline. Only public keys.
+    prekeys: HashMap<String, Prekeys>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Prekeys {
+    otks: Vec<Key>,
+    /// Handed out (again and again) once the one-time ones run out.
+    fallback: Option<Key>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Invite {
     by: String,
-    expires: chrono::DateTime<chrono::Utc>,
-}
-
-/// "abcde-fghjk" and "ABCDEFGHJK" are the same code.
-pub fn normalize_code(s: &str) -> String {
-    s.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
+    expires: DateTime<Utc>,
 }
 
 fn new_code() -> String {
-    let mut b = [0u8; 10];
-    OsRng.fill_bytes(&mut b);
-    let c: String = b
-        .iter()
-        .map(|x| CODE_CHARS[*x as usize % CODE_CHARS.len()] as char)
-        .collect();
-    format!("{}-{}", &c[..5], &c[5..])
+    // rejection sampling: 248 is the largest multiple of 31 that fits a byte
+    let n = CODE_CHARS.len();
+    let mut c = String::new();
+    while c.len() < CODE_LEN {
+        let mut b = [0u8; 16];
+        OsRng.fill_bytes(&mut b);
+        c.extend(
+            b.iter()
+                .filter(|&&x| (x as usize) < 256 / n * n)
+                .map(|&x| CODE_CHARS[x as usize % n] as char),
+        );
+    }
+    format!("{}-{}", &c[..5], &c[5..CODE_LEN])
 }
 
 struct Server {
     state: State,
     online: HashMap<String, (u64, mpsc::Sender<Pkt>)>,
     path: PathBuf,
+    dirty: bool, // queue changed since the last save
 }
 
 impl Server {
     // ponytail: rewrites the whole file per change; fine for a friend group, use sqlite if it grows.
-    fn save(&self) {
+    fn save(&mut self) {
+        self.dirty = false;
         if let Err(e) = write_private(&self.path, &serde_json::to_vec(&self.state).unwrap()) {
             eprintln!("save failed: {e}");
         }
     }
+}
 
-    /// Every relayed message, still encrypted, one JSON line each in messages.jsonl
-    /// next to the state file. The server has no keys, so it can't read them.
-    fn archive(&self, from: &str, to: &str, data: &[u8]) {
-        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-        let line =
-            serde_json::json!({ "ts": chrono::Utc::now(), "from": from, "to": to, "data": hex });
-        let res = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(self.path.with_file_name("messages.jsonl"))
-            .and_then(|mut f| writeln!(f, "{line}"));
-        if let Err(e) = res {
-            eprintln!("archive failed: {e}");
-        }
+/// Holds one of `max` slots until dropped.
+struct Slot(&'static AtomicUsize);
+
+impl Slot {
+    fn take(n: &'static AtomicUsize, max: usize) -> Option<Slot> {
+        n.try_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            (c < max).then_some(c + 1)
+        })
+        .ok()
+        .map(|_| Slot(n))
     }
 }
 
-pub fn run(addr: &str, path: &Path) {
-    let l = TcpListener::bind(addr).unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The server's socket. Until `deadline` is cleared, every read gets only the
+/// time left before it, so the whole login has to finish by then.
+struct Conn {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(d) = self.deadline {
+            let left = d.checked_duration_since(Instant::now());
+            let left = left
+                .filter(|l| !l.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            self.tcp.set_read_timeout(Some(left))?;
+        }
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+pub fn run(addr: &str, path: &Path, admin: Option<&str>) -> Result<(), String> {
+    if let Some(a) = admin {
+        set_admin(path, a)?;
+    }
+    let l = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!(
         "chatui relay listening on {addr}, state in {}",
         path.display()
     );
-    serve(l, path)
+    serve(l, path);
+    Ok(())
+}
+
+/// Make `user` the admin, before the relay starts (whoever can run this owns the relay anyway).
+fn set_admin(path: &Path, user: &str) -> Result<(), String> {
+    let b = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut state: State = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
+    if !state.users.contains_key(user) {
+        return Err(format!("no user {user} on this relay"));
+    }
+    state.admin = user.into();
+    state.banned.remove(user);
+    write_private(path, &serde_json::to_vec(&state).unwrap()).map_err(|e| e.to_string())
 }
 
 pub fn serve(l: TcpListener, path: &Path) {
-    let state = match fs::read(path) {
+    let archive = path.with_file_name("messages.jsonl");
+    if archive.exists() {
+        eprintln!(
+            "chatui no longer archives messages; delete {} (old ciphertext, kept forever)",
+            archive.display()
+        );
+    }
+    let state: State = match fs::read(path) {
         Ok(b) => {
             serde_json::from_slice(&b).expect("state file is corrupt, refusing to overwrite it")
         }
         Err(_) => State::default(),
     };
+    if state.admin.is_empty() && !state.users.is_empty() {
+        eprintln!(
+            "this relay has no admin, so nobody can remove people: restart it once with \
+             `chatui serve --admin <your username>`"
+        );
+    }
     // ponytail: one global lock; per-user locks if this ever serves more than a handful of people
     let srv: &'static Mutex<Server> = Box::leak(Box::new(Mutex::new(Server {
         state,
         online: HashMap::new(),
         path: path.into(),
+        dirty: false,
     })));
+    // offline messages are saved in batches, so a burst of them isn't a burst of rewrites
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut s = srv.lock().unwrap();
+            if s.dirty {
+                s.save();
+            }
+        }
+    });
     let sk: &'static SecretKey = Box::leak(Box::new(SecretKey::generate(&mut OsRng)));
     static CONN_ID: AtomicU64 = AtomicU64::new(0);
+    static CONNS: AtomicUsize = AtomicUsize::new(0);
+    static LOGINS: AtomicUsize = AtomicUsize::new(0);
     for c in l.incoming().flatten() {
+        // over the limit: drop the socket, so a flood can't run us out of threads
+        let Some(conn) = Slot::take(&CONNS, MAX_CONNS) else {
+            continue;
+        };
+        let Some(login) = Slot::take(&LOGINS, MAX_LOGINS) else {
+            continue;
+        };
         let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-        std::thread::spawn(move || handle(c, id, srv, sk));
+        std::thread::spawn(move || {
+            let _conn = conn;
+            handle(c, id, srv, sk, login)
+        });
     }
 }
 
@@ -117,10 +226,13 @@ fn err_pkt(e: &str, id: &str) -> Pkt {
     }
 }
 
-fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Option<()> {
+fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: Slot) -> Option<()> {
     c.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    c.set_read_timeout(Some(Duration::from_secs(10))).ok(); // login must not hang
     let ctl = c.try_clone().ok()?;
+    let c = Conn {
+        tcp: c,
+        deadline: Some(Instant::now() + LOGIN),
+    };
     let mut ws = tungstenite::accept_with_config(c, Some(ws_config())).ok()?;
 
     let mut challenge = vec![0u8; 32];
@@ -136,7 +248,7 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
     }
     let a = recv(&mut ws)?;
     let (user, key) = (a.user, a.key?);
-    let refuse = |mut ws: WebSocket<TcpStream>, e: &str| {
+    let refuse = |mut ws: WebSocket<Conn>, e: &str| {
         send(&mut ws, &err_pkt(e, ""));
         let _ = ws.close(None);
         let _ = ws.flush();
@@ -152,18 +264,24 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
     let mut inviter = String::new();
     {
         let mut s = srv.lock().unwrap();
+        let now = Utc::now();
         match s.state.users.get(&user) {
             Some(k) if *k != key => return refuse(ws, "username taken"),
+            // only the account's owner learns it was removed
+            Some(_) if s.state.banned.contains(&user) => {
+                return refuse(ws, "you were removed from this relay");
+            }
             Some(_) => {}
             // invite only: the first account (whoever runs the relay) is free,
             // everyone after that needs a code from someone who's already in
             None if !s.state.users.is_empty() => {
-                let now = chrono::Utc::now();
-                let code = normalize_code(&a.id);
+                // a full code also carries the inviter's key pin, which isn't ours to check
+                let code: String = normalize_code(&a.id).chars().take(CODE_LEN).collect();
                 match s.state.invites.remove(&code) {
-                    Some(i) if i.expires > now => {
+                    Some(i) if i.expires > now && !s.state.banned.contains(&i.by) => {
                         inviter = i.by;
                         s.state.users.insert(user.clone(), key);
+                        s.state.joined.insert(user.clone(), now);
                         s.save();
                     }
                     _ if a.id.is_empty() => {
@@ -177,6 +295,8 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
             }
             None => {
                 s.state.users.insert(user.clone(), key);
+                s.state.joined.insert(user.clone(), now);
+                s.state.admin = user.clone();
                 s.save();
             }
         }
@@ -185,27 +305,51 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
             &Pkt {
                 t: "ok".into(),
                 from: inviter,
+                admin: s.state.admin == user,
+                count: s.state.prekeys.get(&user).map_or(0, |p| p.otks.len()),
                 ..Default::default()
             },
         );
         // ponytail: handing a packet to a live connection counts as delivered; add client acks if messages go missing
-        for p in s.state.queue.remove(&user).unwrap_or_default() {
-            let _ = tx.send(p);
+        if let Some(q) = s.state.queue.remove(&user) {
+            for p in q {
+                let _ = tx.send(p);
+            }
+            s.dirty = true;
         }
-        s.save();
-        s.online.insert(user.clone(), (conn, tx.clone()));
+        // the map holds this connection's only sender: when it's replaced (a newer
+        // login) or removed (a ban), `rx` disconnects and `pump` closes the socket
+        s.online.insert(user.clone(), (conn, tx));
     }
 
+    drop(login);
+    ws.get_mut().deadline = None;
     ctl.set_read_timeout(Some(POLL)).ok();
     pump(ws, rx, |mut p| {
         let mut s = srv.lock().unwrap();
+        let Some(tx) = s
+            .online
+            .get(&user)
+            .filter(|(id, _)| *id == conn)
+            .map(|(_, t)| t.clone())
+        else {
+            return; // kicked, closing
+        };
         match p.t.as_str() {
             "send" => {
                 if !s.state.users.contains_key(&p.to) {
                     let _ = tx.send(err_pkt(&format!("unknown user {}", p.to), &p.id));
                     return;
                 }
-                s.archive(&user, &p.to, &p.data);
+                if s.state.banned.contains(&p.to) {
+                    let e = format!("{} was removed from this relay", p.to);
+                    let _ = tx.send(err_pkt(&e, &p.id));
+                    return;
+                }
+                if p.data.len() > MAX_DATA {
+                    let _ = tx.send(err_pkt("message too big", &p.id));
+                    return;
+                }
                 let out = Pkt {
                     t: "msg".into(),
                     from: user.clone(),
@@ -219,12 +363,13 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                 };
                 if let Some(out) = undelivered {
                     let q = s.state.queue.entry(p.to.clone()).or_default();
-                    if q.len() >= MAX_QUEUE {
+                    let bytes: usize = q.iter().map(|m| m.data.len()).sum();
+                    if q.len() >= MAX_QUEUE || bytes + out.data.len() > MAX_INBOX_BYTES {
                         let _ = tx.send(err_pkt(&format!("{}'s inbox is full", p.to), &p.id));
                         return;
                     }
                     q.push(out);
-                    s.save();
+                    s.dirty = true;
                 }
                 let _ = tx.send(Pkt {
                     t: "ack".into(),
@@ -234,10 +379,22 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                 });
             }
             "invite" => {
-                let now = chrono::Utc::now();
+                let now = Utc::now();
+                let admin = s.state.admin == user;
+                let age = s.state.joined.get(&user).map(|j| now - *j);
+                if !admin && age.is_some_and(|a| a < chrono::Duration::hours(NEW_ACCOUNT_HOURS)) {
+                    let e = format!("new accounts can invite after {NEW_ACCOUNT_HOURS} hours");
+                    let _ = tx.send(err_pkt(&e, &p.id));
+                    return;
+                }
                 s.state.invites.retain(|_, i| i.expires > now);
-                if s.state.invites.values().filter(|i| i.by == user).count() >= MAX_INVITES {
-                    let e = format!("you have {MAX_INVITES} unused invites already");
+                let max = if admin {
+                    MAX_ADMIN_INVITES
+                } else {
+                    MAX_INVITES
+                };
+                if s.state.invites.values().filter(|i| i.by == user).count() >= max {
+                    let e = format!("you have {max} unused invites already");
                     let _ = tx.send(err_pkt(&e, &p.id));
                     return;
                 }
@@ -255,12 +412,103 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                 });
             }
             "keys" => {
+                if p.users.len() > MAX_KEYS {
+                    let _ = tx.send(err_pkt("too many users in one lookup", &p.id));
+                    return;
+                }
                 p.keys = p
                     .users
                     .iter()
+                    .filter(|u| !s.state.banned.contains(*u))
                     .filter_map(|u| s.state.users.get(u).map(|k| (u.clone(), *k)))
                     .collect();
                 let _ = tx.send(p);
+            }
+            // publish our prekeys: newest kept, at most MAX_PREKEYS
+            "prekeys" => {
+                let pk = s.state.prekeys.entry(user.clone()).or_default();
+                for k in p.otks {
+                    if !pk.otks.contains(&k) {
+                        pk.otks.push(k);
+                    }
+                }
+                let extra = pk.otks.len().saturating_sub(MAX_PREKEYS);
+                pk.otks.drain(..extra);
+                if p.key.is_some() {
+                    pk.fallback = p.key;
+                }
+                let count = pk.otks.len();
+                s.dirty = true;
+                let _ = tx.send(Pkt {
+                    t: "prekeys".into(),
+                    count,
+                    ..Default::default()
+                });
+            }
+            // one prekey per user asked for, to start a session with them
+            "claim" => {
+                if p.users.len() > MAX_KEYS {
+                    let _ = tx.send(err_pkt("too many users in one lookup", &p.id));
+                    return;
+                }
+                let mut keys = BTreeMap::new();
+                for u in &p.users {
+                    if s.state.banned.contains(u) {
+                        continue;
+                    }
+                    if let Some(pk) = s.state.prekeys.get_mut(u) {
+                        let k = if pk.otks.is_empty() {
+                            pk.fallback
+                        } else {
+                            Some(pk.otks.remove(0))
+                        };
+                        if let Some(k) = k {
+                            keys.insert(u.clone(), k);
+                        }
+                    }
+                }
+                s.dirty = true;
+                let _ = tx.send(Pkt {
+                    t: "claim".into(),
+                    users: p.users,
+                    keys,
+                    ..Default::default()
+                });
+            }
+            // admin only; an empty `user` just lists who's removed
+            "ban" | "unban" => {
+                if s.state.admin != user {
+                    let _ = tx.send(err_pkt("only the relay admin can remove people", &p.id));
+                    return;
+                }
+                let who = p.user.clone();
+                if !who.is_empty() {
+                    if who == user {
+                        let _ = tx.send(err_pkt("that's you", &p.id));
+                        return;
+                    }
+                    if !s.state.users.contains_key(&who) {
+                        let _ = tx.send(err_pkt(&format!("unknown user {who}"), &p.id));
+                        return;
+                    }
+                    if p.t == "ban" {
+                        s.state.banned.insert(who.clone());
+                        s.state.invites.retain(|_, i| i.by != who);
+                        s.state.queue.remove(&who);
+                        s.state.prekeys.remove(&who);
+                        s.online.remove(&who); // their connection closes
+                    } else {
+                        s.state.banned.remove(&who);
+                    }
+                    s.save();
+                }
+                let _ = tx.send(Pkt {
+                    t: "banned".into(),
+                    id: if who.is_empty() { String::new() } else { p.t },
+                    user: who,
+                    users: s.state.banned.iter().cloned().collect(),
+                    ..Default::default()
+                });
             }
             _ => {}
         }
