@@ -1807,7 +1807,7 @@ impl App {
                     self.popup = Some(Popup::Help);
                 } else if text == "/tutorial" {
                     self.input.take();
-                    self.popup = Some(Popup::Tutorial(0));
+                    self.start_tutorial();
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
@@ -1829,6 +1829,7 @@ impl App {
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('n') => {
                         if *step + 1 < TUTORIAL.len() {
                             *step += 1;
+                            self.set_tutorial_step(*step);
                             true
                         } else {
                             self.finish_tutorial();
@@ -1837,6 +1838,7 @@ impl App {
                     }
                     KeyCode::Left | KeyCode::Char('p') => {
                         *step = step.saturating_sub(1);
+                        self.set_tutorial_step(*step);
                         true
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
