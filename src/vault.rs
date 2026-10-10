@@ -17,7 +17,12 @@ const KDF: (u32, u32, u32) = if cfg!(test) {
 };
 const CHECK: &[u8] = b"chatui-vault-v1";
 const WRONG: &str = "wrong passphrase";
-pub const MIN_PASS: usize = 8;
+pub const MIN_PASS: usize = 6;
+
+/// Long enough to pass: at least MIN_PASS characters (not bytes).
+pub fn long_enough(pass: &str) -> bool {
+    pass.chars().count() >= MIN_PASS
+}
 /// The files kept encrypted.
 pub const FILES: [&str; 2] = ["identity.json", "store.json"];
 
@@ -237,7 +242,7 @@ pub fn unlock(dir: &Path) -> Result<Vault, String> {
     );
     loop {
         let pass = ask("New passphrase: ")?;
-        if pass.chars().count() < MIN_PASS {
+        if !long_enough(&pass) {
             println!("at least {MIN_PASS} characters, please");
             continue;
         }
@@ -290,5 +295,12 @@ mod tests {
         fs::write(dir.join("store.json"), b"{\"contacts\": {}}").unwrap();
         assert!(v.read(&dir.join("store.json")).is_err());
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn passphrase_length() {
+        assert!(!long_enough("12345"));
+        assert!(long_enough("123456"));
+        assert!(long_enough("äöüéé1")); // counts characters, not bytes
     }
 }
