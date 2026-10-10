@@ -23,11 +23,12 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
   signed group records. A member who hasn't yet received a grant may ignore a
   removal, and an invitee takes the admin's name from the person who invited
   them, so a malicious member could claim a false admin. Groups made before
-  admins existed have none, so nobody can remove people from them. The admin
-  can't leave or hand over the role yet.
+  admins existed have none until a member runs `/claim`. Whoever claims first
+  wins, but if two members claim at the same moment they can end up with
+  different admins. A handover is trusted just as far as the current admin's app.
 - **Notifications on screen.** `/notify` shows the sender and the first 100
   characters of a message on your desktop, where anyone looking at the screen
-  can see them.
+  can see them. `/notify hide` shows only "New message" instead.
 
 ## Reporting a problem
 

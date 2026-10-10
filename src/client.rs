@@ -33,6 +33,9 @@ struct Store {
     /// Set with `/notify off`: no desktop notifications for new messages.
     #[serde(default)]
     no_alerts: bool,
+    /// Set with `/notify hide`: notifications say only "New message", not who or what.
+    #[serde(default)]
+    hide_alert_text: bool,
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
     /// Keys we compared in person (safety numbers) or got through an invite code.
@@ -637,12 +640,64 @@ impl App {
         Ok(())
     }
 
-    /// Leaves the open group. The admin can't leave, since there's no handover yet.
+    /// Hands the open group's admin role to `user`. Admin only; then the old admin
+    /// can leave like anyone else.
+    pub(super) fn hand_over(&mut self, user: &str) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin != self.me {
+            return Err("only the group admin can hand the group over".into());
+        }
+        if user == self.me {
+            return Err("that's you".into());
+        }
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        let p = Payload {
+            t: "handover".into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.admin = user.into();
+        c.helpers.retain(|h| h != user);
+        c.msgs
+            .push(notice(format!("you handed the group to {user}")));
+        self.commit();
+        Ok(())
+    }
+
+    /// Takes over a group that has no admin (one made before admins existed).
+    /// Only works while nobody holds the role.
+    pub(super) fn claim_group(&mut self) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if !c.admin.is_empty() {
+            return Err(format!("{} is the admin of this group", c.admin));
+        }
+        let p = Payload {
+            t: "claim".into(),
+            chat: c.id.clone(),
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.admin = self.me.clone();
+        c.msgs
+            .push(notice("you are now the admin of this group".into()));
+        self.commit();
+        Ok(())
+    }
+
+    /// Leaves the open group. The admin hands the group over first.
     pub(super) fn leave_group(&mut self) -> Result<(), String> {
         let ci = self.open_group()?;
         let c = &self.store.chats[ci];
         if c.admin == self.me {
-            return Err("the group admin can't leave yet".into());
+            return Err("hand the group over first: /handover <name>".into());
         }
         let p = Payload {
             t: "leave".into(),
@@ -665,7 +720,7 @@ impl App {
         let (cmd, arg) = text
             .split_once(' ')
             .map_or((text, ""), |(c, a)| (c, a.trim()));
-        let needs_name = matches!(cmd, "/remove" | "/grant" | "/revoke");
+        let needs_name = matches!(cmd, "/remove" | "/grant" | "/revoke" | "/handover");
         if needs_name && arg.is_empty() {
             return Some(Err(format!("usage: {cmd} <name>")));
         }
@@ -673,6 +728,8 @@ impl App {
             "/remove" => Some(self.remove_member(arg)),
             "/grant" => Some(self.set_helper(arg, true)),
             "/revoke" => Some(self.set_helper(arg, false)),
+            "/handover" => Some(self.hand_over(arg)),
+            "/claim" => Some(self.claim_group()),
             "/leave" => Some(self.leave_group()),
             _ => None,
         }
@@ -1408,7 +1465,10 @@ impl App {
         };
         self.sel = ci;
         self.scroll = 0;
-        self.popup = None;
+        // a reply from a friend must not close the first-run tour
+        if !matches!(self.popup, Some(Popup::Tutorial(_))) {
+            self.popup = None;
+        }
         self.focus = Focus::Input;
         self.commit();
     }
@@ -1547,8 +1607,13 @@ impl App {
                 let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
                 let ts = m.ts.clamp(epoch, Utc::now());
                 let open_chat = self.sel == ci;
-                let alert = (!self.store.no_alerts && !(self.focused && open_chat))
-                    .then(|| alert_text(&from, c.group.then_some(c.name.as_str()), &text));
+                let alert = (!self.store.no_alerts && !(self.focused && open_chat)).then(|| {
+                    if self.store.hide_alert_text {
+                        "New message".to_string()
+                    } else {
+                        alert_text(&from, c.group.then_some(c.name.as_str()), &text)
+                    }
+                });
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -1635,7 +1700,7 @@ impl App {
                 );
                 self.sync_keys();
             }
-            "remove" | "grant" | "revoke" | "leave" => {
+            "remove" | "grant" | "revoke" | "leave" | "handover" | "claim" => {
                 let Some(ci) = self.find(&m.chat).filter(|_| !m.chat.is_empty()) else {
                     return;
                 };
@@ -1671,6 +1736,23 @@ impl App {
                         let what = if grant { "let" } else { "stopped" };
                         c.msgs
                             .push(notice(format!("{from} {what} {target} remove people")));
+                    }
+                    "handover" => {
+                        if from != c.admin || !c.members.contains(&target) {
+                            return;
+                        }
+                        c.admin = target.clone();
+                        c.helpers.retain(|u| *u != target);
+                        c.msgs
+                            .push(notice(format!("{from} handed the group to {target}")));
+                    }
+                    "claim" => {
+                        // only a group with no admin can be claimed, by one of its members
+                        if !c.admin.is_empty() || !c.members.contains(&from) {
+                            return;
+                        }
+                        c.admin = from.clone();
+                        c.msgs.push(notice(format!("{from} is now the admin")));
                     }
                     _ => {
                         if !c.members.contains(&from) {
@@ -2456,6 +2538,45 @@ mod tests {
         fs::remove_file(&state).ok();
     }
 
+    #[test]
+    fn friend_reply_keeps_the_tour_open() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.start_tutorial();
+        let bob = SecretKey::generate(&mut OsRng).public_key().to_bytes();
+        alice.on_keys(Pkt {
+            users: vec!["bob".into()],
+            keys: BTreeMap::from([("bob".to_string(), bob)]),
+            ..Default::default()
+        });
+        assert!(alice.find("bob").is_some(), "the chat was opened");
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(0))),
+            "the tour stays open"
+        );
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn notify_hide_and_show_toggle_the_text() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let mut type_line = |alice: &mut App, line: &str| {
+            alice.focus = Focus::Input;
+            for c in line.chars() {
+                alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        assert!(!alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify hide");
+        assert!(alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify show");
+        assert!(!alice.store.hide_alert_text);
+        fs::remove_file(&state).ok();
+    }
+
     /// Quitting mid-tour: the step is on disk, and the next start picks it up.
     #[test]
     fn tutorial_resumes_after_quitting_midway() {
@@ -2677,6 +2798,61 @@ mod tests {
             group(a).is_some_and(|c| !c.members.contains(&"bob".into()))
         });
         assert!(group(&bob).unwrap().removed);
+        fs::remove_file(&state).ok();
+    }
+
+    /// A group without an admin can be claimed once; the admin can hand the role
+    /// to someone else, and then leave.
+    #[test]
+    fn handover_and_claim() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        for a in [&mut alice, &mut bob, &mut carol] {
+            a.sel = a.find(&gid).unwrap();
+        }
+
+        // the admin can't leave until someone else has the role
+        assert!(alice.leave_group().unwrap_err().contains("/handover"));
+
+        // an old group has no admin: the first member to claim it gets the role
+        for a in [&mut alice, &mut bob, &mut carol] {
+            let ci = a.find(&gid).unwrap();
+            a.store.chats[ci].admin.clear();
+        }
+        carol.claim_group().unwrap();
+        settle(&mut carol, &rc);
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| c.admin == "carol")
+        });
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| c.admin == "carol")
+        });
+        assert!(bob.claim_group().is_err(), "carol already holds it");
+
+        // the admin hands the group to bob, and then can leave like anyone else
+        assert!(carol.hand_over("nobody").is_err());
+        assert!(bob.hand_over("alice").is_err(), "only the admin can");
+        carol.hand_over("bob").unwrap();
+        settle(&mut carol, &rc);
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| c.admin == "bob")
+        });
+        assert!(carol.leave_group().is_ok());
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"carol".into()))
+        });
         fs::remove_file(&state).ok();
     }
 
