@@ -473,6 +473,29 @@ impl App {
         }
     }
 
+    /// Accepts `u`'s new key, after you've compared safety numbers: forgets the old key,
+    /// its verification and its encryption sessions, then fetches the new key.
+    pub(super) fn accept_new_key(&mut self, u: &str) -> Result<(), String> {
+        if !self.store.contacts.contains_key(u) {
+            return Err(format!("there's no key for {u} to replace"));
+        }
+        if self.conn.is_none() {
+            return Err("offline — try again when connected".into());
+        }
+        self.store.contacts.remove(u);
+        self.store.verified.remove(u);
+        self.store.expect.remove(u);
+        self.olm.forget(u);
+        let _ = self.save_olm();
+        self.commit();
+        self.request_keys(vec![u.into()], String::new(), String::new())?;
+        self.notify(
+            format!("accepted {u}'s new key — compare safety numbers (i) to be sure"),
+            false,
+        );
+        Ok(())
+    }
+
     fn notify(&mut self, msg: impl Into<String>, err: bool) {
         self.toast = Some((msg.into(), err, Instant::now()));
     }
@@ -2287,6 +2310,35 @@ mod tests {
         type_line(&mut alice, "/receipts on");
         assert!(!alice.store.no_receipts);
         assert!(alice.input.text.is_empty());
+    }
+
+    /// After someone reinstalls, their key changes. The old one is refused until you
+    /// accept the new one, which should follow a safety number check.
+    #[test]
+    fn new_key_is_accepted_only_on_request() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (bob, _rb) = app(&addr, "bob", &code);
+
+        // alice still has bob's old key, and had verified it
+        let old: Key = [9; 32];
+        alice.store.contacts.insert("bob".into(), old);
+        alice.store.verified.insert("bob".into(), old);
+        assert!(
+            alice.check_key("bob", &pk(&bob)).is_err(),
+            "new key refused by default"
+        );
+
+        assert!(
+            alice.accept_new_key("nobody").is_err(),
+            "nothing to replace"
+        );
+        alice.accept_new_key("bob").unwrap();
+        until(&mut alice, &ra, |a| {
+            a.store.contacts.get("bob") == Some(&pk(&bob))
+        });
+        assert!(!alice.verified("bob"), "the new key must be checked again");
         fs::remove_file(&state).ok();
     }
 
