@@ -263,10 +263,48 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// System clipboard via OSC 52: most terminals, and tmux with set-clipboard on.
-fn copy(text: &str) {
+/// Copy to the clipboard. On this machine, the OS's own tool does it (iTerm2 and
+/// Terminal.app ignore OSC 52 by default); OSC 52 goes out too, as the only way
+/// through SSH (and tmux with set-clipboard on). True if we know it worked.
+fn copy(text: &str) -> bool {
     let mut out = io::stdout();
     let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).and_then(|_| out.flush());
+    let remote = ["SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+    !remote && native_copy(text)
+}
+
+fn native_copy(text: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        pipe("/usr/bin/pbcopy", &[], text)
+    } else if cfg!(windows) {
+        let root = std::env::var("SystemRoot").unwrap_or(r"C:\Windows".into());
+        pipe(&format!(r"{root}\System32\clip.exe"), &[], text)
+    } else {
+        pipe("wl-copy", &[], text)
+            || pipe("xclip", &["-selection", "clipboard"], text)
+            || pipe("xsel", &["--clipboard", "--input"], text)
+    }
+}
+
+/// Run `cmd` (no shell) with `text` on its stdin; true if it took it.
+fn pipe(cmd: &str, args: &[&str], text: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut i| i.write_all(text.as_bytes()).is_ok());
+    wrote && child.wait().is_ok_and(|s| s.success())
 }
 
 fn invite_message(code: &str) -> String {
@@ -1917,8 +1955,14 @@ impl App {
                 KeyCode::Char('c') | KeyCode::Enter
                     if !code.is_empty() && !code.starts_with("error: ") =>
                 {
-                    copy(&invite_message(code));
-                    self.notify("copied — paste it to your friend", false);
+                    if copy(&invite_message(code)) {
+                        self.notify("copied — paste it to your friend", false);
+                    } else {
+                        self.notify(
+                            "sent to your terminal's clipboard; if pasting doesn't work, select the message above",
+                            false,
+                        );
+                    }
                     false
                 }
                 KeyCode::Esc | KeyCode::Char('q' | 'v') => false,
@@ -1994,6 +2038,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_tool_gets_the_text() {
+        let out = std::env::temp_dir().join(format!("chatui-clip-{}", std::process::id()));
+        let sh = format!("cat > '{}'", out.display());
+        assert!(pipe("/bin/sh", &["-c", &sh], "invite code: 7KQ2M"));
+        assert_eq!(fs::read_to_string(&out).unwrap(), "invite code: 7KQ2M");
+        assert!(!pipe("/nonexistent/clipboard-tool", &[], "x"));
+        assert!(!pipe("/bin/sh", &["-c", "exit 1"], "x"));
+        fs::remove_file(out).ok();
+    }
 
     #[test]
     fn base64() {
