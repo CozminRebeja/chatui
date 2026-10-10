@@ -83,8 +83,11 @@ Type these in the message box:
 Whoever makes a group is its admin. Only the admin, or a member the admin has
 granted, can `/remove` people; anyone can `/leave`, except the admin, who
 hands the role over with `/handover` first. A group made before admins existed
-has none: the first member to `/claim` it becomes admin. Everyone in a group
-needs 0.9.8 or newer for these to work.
+has none: the first member to `/claim` it becomes admin. The admin signs the
+list of who may remove people, so members can check it and a helper's removal
+works even if someone missed the grant. Everyone in a group needs 0.9.8 or newer
+for the group rules, and the newest version for the signed list; older ones keep
+working, just without the check.
 
 ## Back up your account
 
