@@ -1237,8 +1237,10 @@ impl App {
                         Quote::of,
                     )
                 });
-                // a sender can't post into the future (and sort to the bottom forever)
-                let ts = m.ts.min(Utc::now());
+                // a sender can't post into the future (and sort to the bottom forever),
+                // or before 1970: times at chrono's limits crash local-time display
+                let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+                let ts = m.ts.clamp(epoch, Utc::now());
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -1665,6 +1667,14 @@ mod tests {
         let f = msgs.iter().find(|m| m.id == "future").unwrap();
         assert!(f.ts <= Utc::now());
         assert!(f.reply.as_ref().unwrap().unconfirmed);
+        // ...and from the far past: kept at 1970, never stored at chrono's limit
+        let mut p = msg("ancient", "alice");
+        p.ts = DateTime::<Utc>::MIN_UTC;
+        bob.send_to("alice", "", &p);
+        settle(&mut bob, &rb);
+        until(&mut alice, &ra, |a| dm(a).iter().any(|m| m.id == "ancient"));
+        let a = dm(&alice).into_iter().find(|m| m.id == "ancient").unwrap();
+        assert_eq!(a.ts.timestamp(), 0);
 
         // a read receipt for a group from someone not in it changes nothing
         let gid = format!("g{}", rand_id());
@@ -1910,5 +1920,4 @@ mod tests {
         fs::remove_file(&state).ok();
         fs::remove_file(state.with_file_name("messages.jsonl")).ok();
     }
-
 }

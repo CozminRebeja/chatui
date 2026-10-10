@@ -633,8 +633,7 @@ impl App {
         let mut prev: Option<&Msg> = None;
         for m in &c.msgs {
             let when = local(m.ts);
-            let new_day =
-                prev.is_none_or(|p| local(p.ts).date_naive() != when.date_naive());
+            let new_day = prev.is_none_or(|p| local(p.ts).date_naive() != when.date_naive());
             if new_day {
                 if !out.is_empty() {
                     out.push(Line::default());
@@ -2008,7 +2007,9 @@ mod tests {
             let _ = day_label(local(ts));
         }
         // ordinary times are shown unchanged
-        let t = DateTime::parse_from_rfc3339("2026-10-10T08:57:04Z").unwrap().with_timezone(&Utc);
+        let t = DateTime::parse_from_rfc3339("2026-10-10T08:57:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(local(t), t.with_timezone(&Local));
     }
 }
