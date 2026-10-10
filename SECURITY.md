@@ -7,7 +7,7 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
 - **Message contents**: sealed with Olm (double ratchet), so past messages stay
   unreadable even if a key is stolen later.
 - **Your key and history on disk**: encrypted with your passphrase (Argon2id,
-  XSalsa20-Poly1305). Choose one of at least 6 characters, and remember it: without
+  XSalsa20-Poly1305). Choose one of at least 8 characters, and remember it: without
   it the account on that device can't be recovered.
 - **Who you're talking to**: safety numbers, which you should compare in person or
   over another app (`i` in a chat). Invite codes pin the inviter's key.

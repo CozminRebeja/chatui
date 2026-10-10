@@ -17,7 +17,7 @@ const KDF: (u32, u32, u32) = if cfg!(test) {
 };
 const CHECK: &[u8] = b"chatui-vault-v1";
 const WRONG: &str = "wrong passphrase";
-pub const MIN_PASS: usize = 6;
+pub const MIN_PASS: usize = 8;
 
 /// Long enough to pass: at least MIN_PASS characters (not bytes).
 pub fn long_enough(pass: &str) -> bool {
@@ -299,8 +299,9 @@ mod tests {
 
     #[test]
     fn passphrase_length() {
-        assert!(!long_enough("12345"));
-        assert!(long_enough("123456"));
-        assert!(long_enough("äöüéé1")); // counts characters, not bytes
+        assert!(!long_enough("1234567"));
+        assert!(long_enough("12345678"));
+        assert!(!long_enough("äöüéé12")); // counts characters, not bytes
+        assert!(long_enough("äöüéé123"));
     }
 }
