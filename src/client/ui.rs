@@ -1869,6 +1869,17 @@ impl App {
                             );
                         }
                     }
+                } else if let Some(name) = text.strip_prefix("/accept") {
+                    self.input.take();
+                    let name = name.trim();
+                    if name.is_empty() {
+                        self.notify(
+                            "usage: /accept <name>, after comparing safety numbers (i)",
+                            true,
+                        );
+                    } else if let Err(e) = self.accept_new_key(name) {
+                        self.notify(e, true);
+                    }
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
