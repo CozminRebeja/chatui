@@ -379,10 +379,10 @@ impl App {
         );
 
         f.render_widget(label("Server", s.focus == 1), s_label);
-        field(f, s_field, &s.server, s.focus == 1, "host:6769");
+        field(f, s_field, &s.server, s.focus == 1, "chat.example.com");
         f.render_widget(
             help(vec![
-                Line::from("The chatui server your group shares, written as host:port."),
+                Line::from("The chatui server your group shares: a domain, or host:port on your own network."),
                 match option_env!("CHATUI_SERVER") {
                     Some(d) => Line::from(vec![
                         "• Your group's server is filled in: ".into(),
@@ -394,7 +394,7 @@ impl App {
                 Line::from(vec![
                     "• Hosting it yourself? On an always-on machine run ".into(),
                     code("brew services start chatui"),
-                    " and use that machine's name with :6769.".into(),
+                    " and use that machine's name with :6769 (same network only).".into(),
                 ]),
             ]),
             s_help,
@@ -854,7 +854,7 @@ impl App {
                     ]),
                     rows[2],
                 );
-                input_row(f, rows[4], "Server", server, true, "host:6769");
+                input_row(f, rows[4], "Server", server, true, "chat.example.com");
                 f.render_widget(
                     Line::from(
                         "Changing server keeps your key; your name is claimed on the new relay.",

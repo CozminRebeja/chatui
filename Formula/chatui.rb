@@ -9,7 +9,7 @@ class Chatui < Formula
 
   def install
     # prefilled on the first-run screen; anyone can change it there
-    ENV["CHATUI_SERVER"] = "minpi.local:6769"
+    ENV["CHATUI_SERVER"] = "chat.rebeja.co"
     system "cargo", "install", *std_cargo_args
   end
 

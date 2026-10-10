@@ -2,8 +2,9 @@ use crate::*;
 use crypto_box::aead::rand_core::RngCore;
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
+use tungstenite::WebSocket;
 
 const MAX_QUEUE: usize = 5000;
 
@@ -17,7 +18,7 @@ struct State {
 
 struct Server {
     state: State,
-    online: HashMap<String, (u64, TcpStream)>,
+    online: HashMap<String, (u64, mpsc::Sender<Pkt>)>,
     path: PathBuf,
 }
 
@@ -77,48 +78,51 @@ pub fn serve(l: TcpListener, path: &Path) {
     }
 }
 
-fn err(w: &mut TcpStream, e: &str, id: &str) -> Option<()> {
-    let _ = send(
-        w,
-        &Pkt {
-            t: "err".into(),
-            err: e.into(),
-            id: id.into(),
-            ..Default::default()
-        },
-    );
-    None
+fn err_pkt(e: &str, id: &str) -> Pkt {
+    Pkt {
+        t: "err".into(),
+        err: e.into(),
+        id: id.into(),
+        ..Default::default()
+    }
 }
 
 fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Option<()> {
     c.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let mut w = c.try_clone().ok()?;
-    let mut r = BufReader::new(c);
+    c.set_read_timeout(Some(Duration::from_secs(10))).ok(); // login must not hang
+    let ctl = c.try_clone().ok()?;
+    let mut ws = tungstenite::accept_with_config(c, Some(ws_config())).ok()?;
 
     let mut challenge = vec![0u8; 32];
     OsRng.fill_bytes(&mut challenge);
-    send(
-        &mut w,
-        &Pkt {
-            t: "challenge".into(),
-            key: Some(sk.public_key().to_bytes()),
-            data: challenge.clone(),
-            ..Default::default()
-        },
-    )
-    .ok()?;
-    let a = recv(&mut r)?;
+    let hello = Pkt {
+        t: "challenge".into(),
+        key: Some(sk.public_key().to_bytes()),
+        data: challenge.clone(),
+        ..Default::default()
+    };
+    if !send(&mut ws, &hello) {
+        return None;
+    }
+    let a = recv(&mut ws)?;
     let (user, key) = (a.user, a.key?);
+    let refuse = |mut ws: WebSocket<TcpStream>, e: &str| {
+        send(&mut ws, &err_pkt(e, ""));
+        let _ = ws.close(None);
+        let _ = ws.flush();
+        None
+    };
     if !valid_name(&user) {
-        return err(&mut w, "bad username (1-20 chars: a-z 0-9 _ -)", "");
+        return refuse(ws, "bad username (1-20 chars: a-z 0-9 _ -)");
     }
     if open(&key, sk, &a.data) != Some([AUTH_PREFIX, &challenge].concat()) {
-        return err(&mut w, "auth failed", "");
+        return refuse(ws, "auth failed");
     }
+    let (tx, rx) = mpsc::channel();
     {
         let mut s = srv.lock().unwrap();
         match s.state.users.get(&user) {
-            Some(k) if *k != key => return err(&mut w, "username taken", ""),
+            Some(k) if *k != key => return refuse(ws, "username taken"),
             Some(_) => {}
             None => {
                 s.state.users.insert(user.clone(), key);
@@ -126,29 +130,28 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
             }
         }
         send(
-            &mut w,
+            &mut ws,
             &Pkt {
                 t: "ok".into(),
                 ..Default::default()
             },
-        )
-        .ok()?;
-        let queued = s.state.queue.remove(&user).unwrap_or_default();
-        if !queued.iter().all(|p| send(&mut w, p).is_ok()) {
-            s.state.queue.insert(user, queued); // keep them for next time
-            return None;
+        );
+        // ponytail: handing a packet to a live connection counts as delivered; add client acks if messages go missing
+        for p in s.state.queue.remove(&user).unwrap_or_default() {
+            let _ = tx.send(p);
         }
         s.save();
-        s.online.insert(user.clone(), (conn, w.try_clone().ok()?));
+        s.online.insert(user.clone(), (conn, tx.clone()));
     }
 
-    while let Some(mut p) = recv(&mut r) {
+    ctl.set_read_timeout(Some(POLL)).ok();
+    pump(ws, rx, |mut p| {
         let mut s = srv.lock().unwrap();
         match p.t.as_str() {
             "send" => {
                 if !s.state.users.contains_key(&p.to) {
-                    let _ = err(&mut w, &format!("unknown user {}", p.to), &p.id);
-                    continue;
+                    let _ = tx.send(err_pkt(&format!("unknown user {}", p.to), &p.id));
+                    return;
                 }
                 s.archive(&user, &p.to, &p.data);
                 let out = Pkt {
@@ -158,29 +161,25 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                     data: p.data,
                     ..Default::default()
                 };
-                // ponytail: a successful socket write counts as delivered; add client-side acks if messages go missing
-                let delivered = s
-                    .online
-                    .get_mut(&p.to)
-                    .is_some_and(|(_, c)| send(c, &out).is_ok());
-                if !delivered {
+                let undelivered = match s.online.get(&p.to) {
+                    Some((_, to)) => to.send(out).err().map(|e| e.0),
+                    None => Some(out),
+                };
+                if let Some(out) = undelivered {
                     let q = s.state.queue.entry(p.to.clone()).or_default();
                     if q.len() >= MAX_QUEUE {
-                        let _ = err(&mut w, &format!("{}'s inbox is full", p.to), &p.id);
-                        continue;
+                        let _ = tx.send(err_pkt(&format!("{}'s inbox is full", p.to), &p.id));
+                        return;
                     }
                     q.push(out);
                     s.save();
                 }
-                let _ = send(
-                    &mut w,
-                    &Pkt {
-                        t: "ack".into(),
-                        id: p.id,
-                        to: p.to,
-                        ..Default::default()
-                    },
-                );
+                let _ = tx.send(Pkt {
+                    t: "ack".into(),
+                    id: p.id,
+                    to: p.to,
+                    ..Default::default()
+                });
             }
             "keys" => {
                 p.keys = p
@@ -188,11 +187,11 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                     .iter()
                     .filter_map(|u| s.state.users.get(u).map(|k| (u.clone(), *k)))
                     .collect();
-                let _ = send(&mut w, &p);
+                let _ = tx.send(p);
             }
             _ => {}
         }
-    }
+    });
     let mut s = srv.lock().unwrap();
     if s.online.get(&user).is_some_and(|(id, _)| *id == conn) {
         s.online.remove(&user);

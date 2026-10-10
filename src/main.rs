@@ -7,15 +7,20 @@ use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
+use std::time::Instant;
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
 pub type Key = [u8; 32];
 
-/// Wire packet, one JSON object per line. Unused fields stay empty.
+/// Wire packet, one JSON object per WebSocket text message. Unused fields stay empty.
 // ponytail: byte fields go over the wire as JSON number arrays; switch to base64 if bandwidth ever matters.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 #[serde(default)]
@@ -37,19 +42,101 @@ pub struct Pkt {
 /// sealing attacker-chosen bytes that would parse as a chat message.
 const AUTH_PREFIX: &[u8] = b"chatui-auth:";
 
-pub fn send(w: &mut impl Write, p: &Pkt) -> io::Result<()> {
-    let mut b = serde_json::to_vec(p)?;
-    b.push(b'\n');
-    w.write_all(&b)
+/// Client socket: plain on a LAN, TLS (wss) behind Cloudflare.
+pub type ClientWs = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// Read timeout while a connection is live, so `pump` can interleave writes.
+pub const POLL: Duration = Duration::from_millis(50);
+
+pub fn ws_config() -> WebSocketConfig {
+    // cap message size so a peer can't exhaust memory
+    WebSocketConfig::default()
+        .max_message_size(Some(1 << 20))
+        .max_frame_size(Some(1 << 20))
 }
 
-pub fn recv(r: &mut impl BufRead) -> Option<Pkt> {
-    let mut line = String::new();
-    // cap line length so a peer can't exhaust memory
-    match r.by_ref().take(1 << 20).read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => serde_json::from_str(&line).ok(),
+pub fn send<S: Read + Write>(ws: &mut WebSocket<S>, p: &Pkt) -> bool {
+    ws.send(Message::text(serde_json::to_string(p).unwrap()))
+        .is_ok()
+}
+
+/// Blocking read of the next packet, used while logging in (before `pump` takes over).
+pub fn recv<S: Read + Write>(ws: &mut WebSocket<S>) -> Option<Pkt> {
+    loop {
+        match ws.read().ok()? {
+            Message::Text(t) => return serde_json::from_str(&t).ok(),
+            Message::Close(_) => return None,
+            _ => {}
+        }
     }
+}
+
+fn timed_out(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+}
+
+/// Runs a live connection until either side goes away: incoming packets go to `on_pkt`,
+/// packets sent into `out` get written. The socket must have a `POLL` read timeout.
+pub fn pump<S: Read + Write>(
+    mut ws: WebSocket<S>,
+    out: Receiver<Pkt>,
+    mut on_pkt: impl FnMut(Pkt),
+) {
+    let mut last_sent = Instant::now();
+    loop {
+        match ws.read() {
+            Ok(Message::Text(t)) => match serde_json::from_str(&t) {
+                Ok(p) => on_pkt(p),
+                Err(_) => return,
+            },
+            Ok(Message::Close(_)) => return,
+            Ok(_) => {}
+            Err(e) if timed_out(&e) => {}
+            Err(_) => return,
+        }
+        loop {
+            match out.try_recv() {
+                Ok(p) if send(&mut ws, &p) => last_sent = Instant::now(),
+                Ok(_) => return,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return;
+                }
+            }
+        }
+        // Cloudflare drops WebSockets that stay quiet for ~100s
+        if last_sent.elapsed() > Duration::from_secs(30) {
+            if ws.send(Message::Ping(Default::default())).is_err() {
+                return;
+            }
+            last_sent = Instant::now();
+        }
+        if let Err(e) = ws.flush()
+            && !timed_out(&e)
+        {
+            return;
+        }
+    }
+}
+
+/// "chat.rebeja.co" → wss on 443 (through Cloudflare); "host:port" → plain ws, for a LAN.
+/// Explicit ws:// or wss:// URLs are used as given. Returns (url, host:port).
+fn endpoint(server: &str) -> (String, String) {
+    let s = server.trim().trim_end_matches('/');
+    let (tls, rest) = match (s.strip_prefix("wss://"), s.strip_prefix("ws://")) {
+        (Some(r), _) => (true, r),
+        (_, Some(r)) => (false, r),
+        _ => (!s.contains(':') || s.ends_with(":443"), s),
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    let addr = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:{}", if tls { 443 } else { 80 })
+    };
+    (format!("{}://{rest}", if tls { "wss" } else { "ws" }), addr)
 }
 
 /// NaCl box: nonce || ciphertext. Authenticates the sender too.
@@ -85,27 +172,33 @@ pub fn fingerprint(k: &Key) -> String {
         .join(" ")
 }
 
-/// Connect and prove we own `sk`. Returns writer + reader positioned after the "ok".
+/// Connect and prove we own `sk`. Returns the socket (logged in) and a handle to
+/// its TCP stream, for setting the read timeout before handing it to `pump`.
 pub fn handshake(
     server: &str,
     user: &str,
     sk: &SecretKey,
-) -> Result<(TcpStream, BufReader<TcpStream>), String> {
+) -> Result<(ClientWs, TcpStream), String> {
+    let (url, addr) = endpoint(server);
     // try every resolved address: .local names often resolve to IPv6 first
     let mut last = "bad server address".to_string();
-    let mut conn = None;
-    for addr in server.to_socket_addrs().map_err(|e| e.to_string())? {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+    let mut tcp = None;
+    for a in addr.to_socket_addrs().map_err(|e| e.to_string())? {
+        match TcpStream::connect_timeout(&a, Duration::from_secs(3)) {
             Ok(s) => {
-                conn = Some(s);
+                tcp = Some(s);
                 break;
             }
             Err(e) => last = e.to_string(),
         }
     }
-    let mut w = conn.ok_or(last)?;
-    let mut r = BufReader::new(w.try_clone().map_err(|e| e.to_string())?);
-    let c = recv(&mut r).ok_or("no challenge")?;
+    let tcp = tcp.ok_or(last)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).ok(); // login must not hang
+    let ctl = tcp.try_clone().map_err(|e| e.to_string())?;
+    let (mut ws, _) =
+        tungstenite::client_tls_with_config(url.as_str(), tcp, Some(ws_config()), None)
+            .map_err(|e| e.to_string())?;
+    let c = recv(&mut ws).ok_or("no challenge")?;
     let (Some(srv), 32) = (c.key, c.data.len()) else {
         return Err("bad challenge".into());
     };
@@ -117,12 +210,14 @@ pub fn handshake(
         data: proof,
         ..Default::default()
     };
-    send(&mut w, &auth).map_err(|e| e.to_string())?;
-    let ok = recv(&mut r).ok_or("connection closed")?;
+    if !send(&mut ws, &auth) {
+        return Err("connection closed".into());
+    }
+    let ok = recv(&mut ws).ok_or("connection closed")?;
     if ok.t != "ok" {
         return Err(ok.err);
     }
-    Ok((w, r))
+    Ok((ws, ctl))
 }
 
 pub fn home() -> PathBuf {
@@ -183,8 +278,30 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    fn pkt(r: &mut BufReader<TcpStream>) -> Pkt {
-        recv(r).expect("packet")
+    fn send_pkt(ws: &mut ClientWs, t: &str, to: &str, id: &str, data: Vec<u8>) {
+        assert!(send(
+            ws,
+            &Pkt {
+                t: t.into(),
+                to: to.into(),
+                id: id.into(),
+                data,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn endpoints() {
+        assert_eq!(
+            endpoint("chat.rebeja.co"),
+            ("wss://chat.rebeja.co".into(), "chat.rebeja.co:443".into())
+        );
+        assert_eq!(
+            endpoint("minpi.local:6769"),
+            ("ws://minpi.local:6769".into(), "minpi.local:6769".into())
+        );
+        assert_eq!(endpoint("ws://h:1/x/"), ("ws://h:1/x".into(), "h:1".into()));
     }
 
     #[test]
@@ -201,64 +318,47 @@ mod tests {
             SecretKey::generate(&mut OsRng),
             SecretKey::generate(&mut OsRng),
         );
-        let (mut aw, mut ar) = handshake(&addr, "alice", &a).unwrap();
-        let (_bw, mut br) = handshake(&addr, "bob", &b).unwrap();
+        let (mut aw, _) = handshake(&addr, "alice", &a).unwrap();
+        let (mut bw, _) = handshake(&addr, "bob", &b).unwrap();
         drop(handshake(&addr, "carol", &c).unwrap()); // register, then go offline
 
         // someone else can't take alice's name
-        assert_eq!(handshake(&addr, "alice", &b).unwrap_err(), "username taken");
+        assert_eq!(
+            handshake(&addr, "alice", &b).err().unwrap(),
+            "username taken"
+        );
 
         // online delivery, sender authenticated, server acks
         let bob = b.public_key().to_bytes();
-        send(
-            &mut aw,
-            &Pkt {
-                t: "send".into(),
-                to: "bob".into(),
-                id: "1".into(),
-                data: seal(&bob, &a, b"hi"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(pkt(&mut ar).t, "ack");
-        let m = pkt(&mut br);
+        send_pkt(&mut aw, "send", "bob", "1", seal(&bob, &a, b"hi"));
+        assert_eq!(recv(&mut aw).unwrap().t, "ack");
+        let m = recv(&mut bw).unwrap();
         assert_eq!(
             (m.from.as_str(), open(&m.key.unwrap(), &b, &m.data).unwrap()),
             ("alice", b"hi".to_vec())
         );
 
         // offline queue
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(300));
         let carol = c.public_key().to_bytes();
-        send(
-            &mut aw,
-            &Pkt {
-                t: "send".into(),
-                to: "carol".into(),
-                id: "2".into(),
-                data: seal(&carol, &a, b"yo"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(pkt(&mut ar).id, "2");
-        let (_cw, mut cr) = handshake(&addr, "carol", &c).unwrap();
-        let m = pkt(&mut cr);
+        send_pkt(&mut aw, "send", "carol", "2", seal(&carol, &a, b"yo"));
+        assert_eq!(recv(&mut aw).unwrap().id, "2");
+        let (mut cw, _) = handshake(&addr, "carol", &c).unwrap();
+        let m = recv(&mut cw).unwrap();
         assert_eq!(open(&m.key.unwrap(), &c, &m.data).unwrap(), b"yo");
 
         // key lookup
-        send(
+        assert!(send(
             &mut aw,
             &Pkt {
                 t: "keys".into(),
                 users: vec!["bob".into(), "nobody".into()],
                 ..Default::default()
-            },
-        )
-        .unwrap();
-        let k = pkt(&mut ar);
+            }
+        ));
+        let k = recv(&mut aw).unwrap();
         assert_eq!((k.keys.get("bob"), k.keys.len()), (Some(&bob), 1));
+
         // everything relayed is archived, encrypted
         let archive = fs::read_to_string(dir.join("messages.jsonl")).unwrap();
         assert_eq!(archive.lines().count(), 2);

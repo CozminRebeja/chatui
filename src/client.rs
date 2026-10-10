@@ -106,7 +106,7 @@ struct App {
     store: Store,
     dir: PathBuf,
     sel: usize,
-    conn: Option<TcpStream>,
+    conn: Option<Sender<Pkt>>, // to the connection thread
     generation: u64,
     tx: Sender<Ev>,
     // ui state
@@ -277,7 +277,7 @@ impl App {
             return;
         }
         if server.is_empty() {
-            s.err = "enter the relay address, e.g. chat.example.com:6769".into();
+            s.err = "enter the server address, e.g. chat.example.com".into();
             return;
         }
         match handshake(&server, &user, &self.sk) {
@@ -310,18 +310,18 @@ impl App {
         self.connect();
     }
 
-    fn attach(&mut self, w: TcpStream, mut r: BufReader<TcpStream>) {
+    fn attach(&mut self, ws: ClientWs, tcp: TcpStream) {
         self.generation += 1;
         let (tx, g) = (self.tx.clone(), self.generation);
+        let (out, rx) = mpsc::channel();
+        tcp.set_read_timeout(Some(POLL)).ok();
         std::thread::spawn(move || {
-            while let Some(p) = recv(&mut r) {
-                if tx.send(Ev::Pkt(p)).is_err() {
-                    return;
-                }
-            }
+            pump(ws, rx, |p| {
+                let _ = tx.send(Ev::Pkt(p));
+            });
             let _ = tx.send(Ev::Down(g));
         });
-        self.conn = Some(w);
+        self.conn = Some(out);
         self.notify(format!("connected to {}", self.server), false);
         // resend whatever never reached the server; receivers drop duplicates by id
         for ci in 0..self.store.chats.len() {
@@ -338,7 +338,10 @@ impl App {
     }
 
     fn write(&mut self, p: &Pkt) -> bool {
-        let ok = self.conn.as_mut().is_some_and(|c| send(c, p).is_ok());
+        let ok = self
+            .conn
+            .as_ref()
+            .is_some_and(|c| c.send(p.clone()).is_ok());
         if !ok {
             self.conn = None;
         }
