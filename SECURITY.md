@@ -25,7 +25,7 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
   a member only checks a signature against a key the admin sent them directly.
   Someone invited by another member takes that member's word on who the admin
   is until the real admin's next signed roster arrives; if they already know the
-  real admin's key, an invite naming them without their signature is refused,
+  real admin's key, an invite naming them without their signature is flagged,
   and a roster signed by someone else claiming to be admin is flagged, not
   believed. A group whose admin runs an older chatui has no signatures and
   works as before. Groups made before admins existed have none until a member
