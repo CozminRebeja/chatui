@@ -381,7 +381,8 @@ const USAGE: &str = "usage:
   chatui mcp                     MCP server so an AI can design themes
                                  (claude mcp add chatui -- chatui mcp)
   chatui backup <file>           save your account (encrypted; chats not included)
-  chatui restore <file>          put a saved account back [--force to replace]";
+  chatui restore <file>          put a saved account back [--force to replace]
+  chatui --version               print the version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -401,6 +402,7 @@ fn main() {
         ["serve", "--release", u] => server::release_cmd(&home().join("server.json"), u).map(say),
         ["serve", addr] => serve(Some(*addr), None),
         ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
+        ["--version"] | ["-V"] => Ok(println!("chatui {}", env!("CARGO_PKG_VERSION"))),
         ["mcp"] => mcp::run(),
         ["backup", file] => backup::backup(&home(), Path::new(file))
             .map(|_| println!("saved to {file}; keep it private, and remember your passphrase")),
