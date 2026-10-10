@@ -433,17 +433,29 @@ impl App {
         }
     }
 
-    fn save_olm(&mut self) {
+    /// Must succeed before anything encrypted with the new state leaves: after a
+    /// restart, the old state on disk would encrypt with a message key again.
+    #[must_use]
+    fn save_olm(&mut self) -> bool {
         let plain = zeroize::Zeroizing::new(serde_json::to_vec(&self.olm).unwrap());
-        if let Err(e) = self.vault.write(&self.dir.join("olm.json"), &plain) {
-            self.notify(format!("could not save encryption state: {e}"), true);
+        match self.vault.write(&self.dir.join("olm.json"), &plain) {
+            Ok(()) => true,
+            Err(e) => {
+                self.notify(
+                    format!("could not save encryption state ({e}); not sending"),
+                    true,
+                );
+                false
+            }
         }
     }
 
     /// Top the relay back up to `PREKEYS` one-time prekeys.
     fn publish_prekeys(&mut self, on_server: usize) {
         let (otks, fallback) = self.olm.new_prekeys(&self.sk, on_server);
-        self.save_olm(); // before anyone can use them
+        if !self.save_olm() {
+            return; // never publish keys we couldn't keep
+        }
         let p = Pkt {
             t: "prekeys".into(),
             otks,
@@ -452,7 +464,7 @@ impl App {
         };
         if self.write(&p) {
             self.olm.published(&self.sk);
-            self.save_olm();
+            let _ = self.save_olm();
         }
     }
 
@@ -618,7 +630,9 @@ impl App {
         let Some(data) = self.olm.encrypt(to, &plain) else {
             return false;
         };
-        self.save_olm();
+        if !self.save_olm() {
+            return false; // stays pending, sent again once saving works
+        }
         self.write(&Pkt {
             t: "send".into(),
             to: to.into(),
@@ -662,7 +676,7 @@ impl App {
                 self.send_payload(u, &id, p);
             }
         }
-        self.save_olm();
+        let _ = self.save_olm(); // nothing leaves on this; send_payload saves first
     }
 
     /// A message from `u` wouldn't decrypt (lost state, or a replay): start a
@@ -1197,7 +1211,7 @@ impl App {
             }
             Err(Fail::Undecryptable) => return self.renew(&from),
         };
-        self.save_olm();
+        let _ = self.save_olm(); // after receiving: nothing leaves, it only warns
         if self.olm.take_new_session() {
             // one of our prekeys was used up: ask how many are left
             self.write(&Pkt {
@@ -1947,12 +1961,18 @@ mod tests {
 
         alice.focus = Focus::Chats;
         alice.on_key(key(KeyCode::Char('?'), shift));
-        assert!(matches!(alice.popup, Some(Popup::Help)), "? in the chat list");
+        assert!(
+            matches!(alice.popup, Some(Popup::Help)),
+            "? in the chat list"
+        );
         alice.popup = None;
 
         alice.focus = Focus::Messages;
         alice.on_key(key(KeyCode::Char('?'), shift));
-        assert!(matches!(alice.popup, Some(Popup::Help)), "? in the messages");
+        assert!(
+            matches!(alice.popup, Some(Popup::Help)),
+            "? in the messages"
+        );
         alice.popup = None;
 
         alice.focus = Focus::Input;
@@ -1962,7 +1982,10 @@ mod tests {
         alice.input = Field::default();
 
         alice.on_key(key(KeyCode::F(1), KeyModifiers::NONE));
-        assert!(matches!(alice.popup, Some(Popup::Help)), "F1 works while typing");
+        assert!(
+            matches!(alice.popup, Some(Popup::Help)),
+            "F1 works while typing"
+        );
         alice.popup = None;
 
         for c in "/help".chars() {
@@ -1970,7 +1993,59 @@ mod tests {
         }
         alice.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(alice.popup, Some(Popup::Help)), "/help opens help");
-        assert!(alice.input.text.is_empty(), "/help is not sent as a message");
+        assert!(
+            alice.input.text.is_empty(),
+            "/help is not sent as a message"
+        );
+        fs::remove_file(&state).ok();
+    }
+
+    /// Saving fails (say the disk is full): the message is held back, never sent
+    /// with ratchet state that a restart would forget, and goes out once saving works.
+    #[test]
+    fn unsaved_ratchet_state_is_never_sent() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (bob, rb) = app(&addr, "bob", &code);
+        let mut bob = bob;
+        alice.store.contacts.insert("bob".into(), pk(&bob));
+        alice.add_chat(Chat::new(
+            "bob".into(),
+            "bob".into(),
+            vec!["bob".into()],
+            false,
+        ));
+        alice.sel = alice.find("bob").unwrap();
+        let said = |a: &App, t: &str| {
+            a.find("alice")
+                .is_some_and(|i| a.store.chats[i].msgs.iter().any(|m| m.text == t))
+        };
+        alice.send_text("first".into());
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| said(a, "first"));
+
+        let dir = std::mem::replace(&mut alice.dir, PathBuf::from("/nonexistent-chatui-dir/x"));
+        alice.send_text("second".into());
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            if let Ok(Ev::Pkt(p)) = ra.recv_timeout(Duration::from_millis(20)) {
+                alice.on_pkt(p);
+            }
+        }
+        let c = &alice.store.chats[alice.find("bob").unwrap()];
+        let m = c.msgs.iter().find(|m| m.text == "second").unwrap();
+        assert!(m.status == Status::Pending, "no ack: it was never sent");
+
+        // the disk is fine again: the next connection sends what's pending
+        alice.dir = dir;
+        let login = handshake(&addr, "alice", &alice.sk, "").unwrap();
+        alice.attach(login);
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| said(a, "second"));
+        for a in [&alice, &bob] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
         fs::remove_file(&state).ok();
     }
 
@@ -1981,7 +2056,10 @@ mod tests {
         alice.dir = PathBuf::from("/nonexistent-chatui-dir/for-test");
         alice.commit(); // would have panicked before
         let (msg, err, _) = alice.toast.clone().unwrap();
-        assert!(err && msg.starts_with("could not save chat history"), "{msg}");
+        assert!(
+            err && msg.starts_with("could not save chat history"),
+            "{msg}"
+        );
         fs::remove_file(&state).ok();
     }
 
