@@ -2135,10 +2135,16 @@ mod tests {
         }
         alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(alice.popup, Some(Popup::Tutorial(0))));
-        assert!(alice.input.text.is_empty(), "/tutorial is not sent as a message");
+        assert!(
+            alice.input.text.is_empty(),
+            "/tutorial is not sent as a message"
+        );
 
         alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(alice.popup, Some(Popup::Tutorial(1))), "Enter goes to the next step");
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(1))),
+            "Enter goes to the next step"
+        );
 
         alice.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(alice.popup.is_none());
@@ -2164,7 +2170,10 @@ mod tests {
         alice.popup = None;
         alice.store = saved;
         alice.resume_tutorial();
-        assert!(matches!(alice.popup, Some(Popup::Tutorial(2))), "resumes at step 3");
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(2))),
+            "resumes at step 3"
+        );
         fs::remove_file(&state).ok();
     }
 }

@@ -9,10 +9,9 @@ const IDENTITY_FILE: &str = "identity.json";
 
 /// Saves the encrypted account files from `home` into one backup file at `dest`.
 pub fn backup(home: &Path, dest: &Path) -> Result<(), String> {
-    let key = read_json(&home.join(KEY_FILE))?
-        .ok_or("no account to back up: run chatui first")?;
-    let identity = read_json(&home.join(IDENTITY_FILE))?
-        .ok_or("no account to back up: run chatui first")?;
+    let key = read_json(&home.join(KEY_FILE))?.ok_or("no account to back up: run chatui first")?;
+    let identity =
+        read_json(&home.join(IDENTITY_FILE))?.ok_or("no account to back up: run chatui first")?;
     check(&key, &identity)?;
     let bundle = json!({ "chatui_backup": 1, "key": key, "identity": identity });
     write_private(dest, &serde_json::to_vec(&bundle).unwrap())
@@ -35,12 +34,17 @@ pub fn restore(src: &Path, home: &Path, force: bool) -> Result<(), String> {
     check(&key, &identity)?;
     let exists = home.join(KEY_FILE).exists() || home.join(IDENTITY_FILE).exists();
     if exists && !force {
-        return Err("an account already exists here; use `restore <file> --force` to replace it".into());
+        return Err(
+            "an account already exists here; use `restore <file> --force` to replace it".into(),
+        );
     }
     write_private(&home.join(KEY_FILE), &serde_json::to_vec(&key).unwrap())
         .map_err(|e| format!("could not restore: {e}"))?;
-    write_private(&home.join(IDENTITY_FILE), &serde_json::to_vec(&identity).unwrap())
-        .map_err(|e| format!("could not restore: {e}"))
+    write_private(
+        &home.join(IDENTITY_FILE),
+        &serde_json::to_vec(&identity).unwrap(),
+    )
+    .map_err(|e| format!("could not restore: {e}"))
 }
 
 fn read_json(path: &Path) -> Result<Option<Value>, String> {
@@ -79,15 +83,23 @@ mod tests {
     /// A home folder with account files shaped like the real ones.
     fn account(name: &str, tag: &str) -> PathBuf {
         let dir = folder(name);
-        let key = json!({ "salt": tag, "m": 1, "t": 1, "p": 1, "check": { "nonce": "n", "ct": "c" } });
+        let key =
+            json!({ "salt": tag, "m": 1, "t": 1, "p": 1, "check": { "nonce": "n", "ct": "c" } });
         let identity = json!({ "nonce": tag, "ct": "encrypted" });
         fs::write(dir.join(KEY_FILE), serde_json::to_vec(&key).unwrap()).unwrap();
-        fs::write(dir.join(IDENTITY_FILE), serde_json::to_vec(&identity).unwrap()).unwrap();
+        fs::write(
+            dir.join(IDENTITY_FILE),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
         dir
     }
 
     fn files(dir: &Path) -> (Value, Value) {
-        (read_json(&dir.join(KEY_FILE)).unwrap().unwrap(), read_json(&dir.join(IDENTITY_FILE)).unwrap().unwrap())
+        (
+            read_json(&dir.join(KEY_FILE)).unwrap().unwrap(),
+            read_json(&dir.join(IDENTITY_FILE)).unwrap().unwrap(),
+        )
     }
 
     #[test]
@@ -109,7 +121,10 @@ mod tests {
         let home = account("perms", "salt-2");
         let file = home.join("backup.json");
         backup(&home, &file).unwrap();
-        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(home).ok();
     }
 
@@ -140,7 +155,11 @@ mod tests {
 
         // a backup with a missing or wrong identity part
         let no_identity = home.join("no-identity.json");
-        fs::write(&no_identity, br#"{"chatui_backup":1,"key":{"salt":"s","check":{}}}"#).unwrap();
+        fs::write(
+            &no_identity,
+            br#"{"chatui_backup":1,"key":{"salt":"s","check":{}}}"#,
+        )
+        .unwrap();
         assert!(restore(&no_identity, &home, false).is_err());
         assert!(!home.join(KEY_FILE).exists() && !home.join(IDENTITY_FILE).exists());
         fs::remove_dir_all(home).ok();

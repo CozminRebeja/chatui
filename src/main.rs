@@ -402,9 +402,14 @@ fn main() {
         ["serve", addr] => serve(Some(*addr), None),
         ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
         ["mcp"] => mcp::run(),
-        ["backup", file] => backup::backup(&home(), Path::new(file)).map(|_| println!("saved to {file}; keep it private, and remember your passphrase")),
-        ["restore", file] => backup::restore(Path::new(file), &home(), false).map(|_| println!("account restored")),
-        ["restore", file, "--force"] => backup::restore(Path::new(file), &home(), true).map(|_| println!("account restored")),
+        ["backup", file] => backup::backup(&home(), Path::new(file))
+            .map(|_| println!("saved to {file}; keep it private, and remember your passphrase")),
+        ["restore", file] => {
+            backup::restore(Path::new(file), &home(), false).map(|_| println!("account restored"))
+        }
+        ["restore", file, "--force"] => {
+            backup::restore(Path::new(file), &home(), true).map(|_| println!("account restored"))
+        }
         [] => client::run(),
         _ => Err(USAGE.into()),
     };
