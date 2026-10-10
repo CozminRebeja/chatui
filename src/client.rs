@@ -1,4 +1,5 @@
 mod e2e;
+mod sign;
 mod ui;
 
 use crate::theme;
