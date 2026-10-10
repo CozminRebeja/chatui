@@ -70,6 +70,27 @@ struct Msg {
     ts: DateTime<Utc>,
     status: Status,
     read_by: Vec<String>,
+    #[serde(default)]
+    reply: Option<Quote>,
+}
+
+/// The message being replied to, copied in so it shows even for people who
+/// don't have the original (e.g. they joined the group later).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+struct Quote {
+    id: String,
+    from: String,
+    text: String,
+}
+
+impl Quote {
+    fn of(m: &Msg) -> Self {
+        Quote {
+            id: m.id.clone(),
+            from: m.from.clone(),
+            text: m.text.chars().take(200).collect(),
+        }
+    }
 }
 
 /// What actually gets encrypted: a chat message, a read receipt or a group invite.
@@ -84,6 +105,7 @@ struct Payload {
     ids: Vec<String>,
     name: String,
     members: BTreeMap<String, Key>,
+    reply: Option<Quote>,
 }
 
 enum Ev {
@@ -91,10 +113,11 @@ enum Ev {
     Down(u64),
 }
 
-/// First run: no identity yet, ask for a username and server.
+/// First run: no identity yet, ask for a username, server and invite code.
 struct Setup {
     user: Field,
     server: Field,
+    invite: Field,
     focus: usize,
     err: String,
     busy: bool, // connect on the next tick, after "connecting…" is drawn
@@ -120,8 +143,10 @@ struct App {
     list: ratatui::widgets::ListState,
     rects: Rects,
     quit: bool,
-    mention_sel: usize, // highlighted @name suggestion
-    theme_err: String,  // last theme load error, so it's shown once
+    mention_sel: usize,   // highlighted @name suggestion
+    msel: Option<String>, // selected message (by id) in the message pane
+    reply_to: Option<Quote>,
+    theme_err: String, // last theme load error, so it's shown once
 }
 
 fn rand_id() -> String {
@@ -164,6 +189,7 @@ fn notice(text: String) -> Msg {
         ts: Utc::now(),
         status: Status::Read,
         read_by: vec![],
+        reply: None,
     }
 }
 
@@ -183,6 +209,7 @@ pub fn run() -> Result<(), String> {
     let setup = id.is_none().then(|| Setup {
         user: Field::default(),
         server: Field::from(option_env!("CHATUI_SERVER").unwrap_or("")),
+        invite: Field::default(),
         focus: 0,
         err: String::new(),
         busy: false,
@@ -215,6 +242,8 @@ pub fn run() -> Result<(), String> {
         rects: Default::default(),
         quit: false,
         mention_sel: 0,
+        msel: None,
+        reply_to: None,
         theme_err: String::new(),
     };
     app.reload_theme();
@@ -328,9 +357,10 @@ impl App {
     fn finish_setup(&mut self) {
         let Some(s) = &mut self.setup else { return };
         s.busy = false;
-        let (user, server) = (
+        let (user, server, invite) = (
             s.user.text.trim().to_string(),
             s.server.text.trim().to_string(),
+            s.invite.text.trim().to_string(),
         );
         if !valid_name(&user) {
             s.err = "username: 1-20 characters, a-z 0-9 _ -".into();
@@ -340,9 +370,9 @@ impl App {
             s.err = "enter the server address, e.g. chat.example.com".into();
             return;
         }
-        match handshake(&server, &user, &self.sk) {
+        match handshake(&server, &user, &self.sk, &invite) {
             Err(e) => s.err = e,
-            Ok((w, r)) => {
+            Ok((w, r, inviter)) => {
                 (self.me, self.server) = (user, server);
                 if let Err(e) = self.save_identity() {
                     if let Some(s) = &mut self.setup {
@@ -352,14 +382,19 @@ impl App {
                 }
                 self.setup = None;
                 self.attach(w, r);
-                self.notify("You're in! Press f to add your first friend.", false);
+                if valid_name(&inviter) && inviter != self.me {
+                    let _ = self.new_dm(&inviter);
+                    self.notify(format!("You're in! {inviter} invited you — say hi."), false);
+                } else {
+                    self.notify("You're in! Press v to invite your friends.", false);
+                }
             }
         }
     }
 
     fn connect(&mut self) {
-        match handshake(&self.server, &self.me, &self.sk) {
-            Ok((w, r)) => self.attach(w, r),
+        match handshake(&self.server, &self.me, &self.sk, "") {
+            Ok((w, r, _)) => self.attach(w, r),
             Err(e) => self.notify(format!("offline ({e}), retrying…"), true),
         }
     }
@@ -431,6 +466,7 @@ impl App {
             id: m.id.clone(),
             text: m.text.clone(),
             ts: m.ts,
+            reply: m.reply.clone(),
             ..Default::default()
         };
         for u in c.members.clone() {
@@ -449,6 +485,7 @@ impl App {
             ts: Utc::now(),
             status: Status::Pending,
             read_by: vec![],
+            reply: self.reply_to.take(),
         };
         self.store.chats[self.sel].msgs.push(m.clone());
         self.deliver(self.sel, &m);
@@ -510,6 +547,8 @@ impl App {
         if i < self.store.chats.len() && i != self.sel {
             self.sel = i;
             self.scroll = 0;
+            self.msel = None;
+            self.reply_to = None;
         }
     }
 
@@ -574,6 +613,19 @@ impl App {
         }
     }
 
+    fn create_invite(&mut self) {
+        if self.write(&Pkt {
+            t: "invite".into(),
+            ..Default::default()
+        }) {
+            self.popup = Some(Popup::Invite {
+                code: String::new(),
+            });
+        } else {
+            self.notify("offline — try again when connected", true);
+        }
+    }
+
     fn delete_chat(&mut self) {
         if self.sel < self.store.chats.len() {
             self.store.chats.remove(self.sel);
@@ -593,7 +645,16 @@ impl App {
                 }
                 self.commit();
             }
-            "err" => self.notify(format!("server: {}", p.err), true),
+            "err" => match &mut self.popup {
+                Some(Popup::Invite { code }) if code.is_empty() => {
+                    *code = format!("error: {}", p.err)
+                }
+                _ => self.notify(format!("server: {}", p.err), true),
+            },
+            "invite" => match &mut self.popup {
+                Some(Popup::Invite { code }) => *code = p.id,
+                _ => self.notify(format!("invite code: {}", p.id), false),
+            },
             "keys" => self.on_keys(p),
             "msg" => self.on_msg(p),
             _ => {}
@@ -608,7 +669,10 @@ impl App {
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            return self.popup_error(format!("no such user: {}", missing.join(", ")));
+            return self.popup_error(format!(
+                "no such user: {} (not on chatui yet? Esc, then v to invite them)",
+                missing.join(", ")
+            ));
         }
         if let Some(u) = p
             .keys
@@ -744,6 +808,16 @@ impl App {
                     return;
                 }
                 let text = clean(&m.text);
+                // trust our own copy of the quoted message over the sender's
+                let reply = m.reply.filter(|q| valid_name(&q.from)).map(|q| {
+                    c.msgs.iter().find(|x| x.id == q.id).map_or(
+                        Quote {
+                            text: clean(&q.text).chars().take(200).collect(),
+                            ..q
+                        },
+                        Quote::of,
+                    )
+                });
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -759,6 +833,7 @@ impl App {
                     ts: m.ts,
                     status: Status::Pending,
                     read_by: vec![],
+                    reply,
                 });
                 // keep the timeline ordered even if a resend arrives late
                 c.msgs.sort_by_key(|x| x.ts);
@@ -849,6 +924,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event::KeyCode;
     use std::net::TcpListener;
 
     #[test]
@@ -859,7 +935,7 @@ mod tests {
         assert!(mentions_user("@bob hi", "bob") && !mentions_user("@bobby hi", "bob"));
     }
 
-    fn app(server: &str, me: &str) -> (App, Receiver<Ev>) {
+    fn app(server: &str, me: &str, invite: &str) -> (App, Receiver<Ev>) {
         let dir = std::env::temp_dir().join(format!("chatui-app-{}-{me}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (tx, rx) = mpsc::channel();
@@ -883,11 +959,31 @@ mod tests {
             rects: Default::default(),
             quit: false,
             mention_sel: 0,
+            msel: None,
+            reply_to: None,
             theme_err: String::new(),
         };
-        a.connect();
-        assert!(a.conn.is_some(), "{me} couldn't connect");
+        let (w, r, _) = handshake(server, me, &a.sk, invite).unwrap();
+        a.attach(w, r);
         (a, rx)
+    }
+
+    /// Press v and wait for the code to show up in the invite popup.
+    fn invite(a: &mut App, rx: &Receiver<Ev>) -> String {
+        a.create_invite();
+        until(
+            a,
+            rx,
+            |a| matches!(&a.popup, Some(Popup::Invite { code }) if !code.is_empty()),
+        );
+        let Some(Popup::Invite { code }) = a.popup.take() else {
+            unreachable!()
+        };
+        code
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.on_key(event::KeyEvent::new(code, event::KeyModifiers::NONE));
     }
 
     /// Feed incoming packets to the app until `done` holds.
@@ -913,10 +1009,13 @@ mod tests {
         let st = state.clone();
         std::thread::spawn(move || server::serve(l, &st));
 
-        let (mut alice, ra) = app(&addr, "alice");
-        let (mut bob, rb) = app(&addr, "bob");
-        let (mut carol, rc) = app(&addr, "carol");
-        let (mut dave, rd) = app(&addr, "dave");
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        let code = invite(&mut bob, &rb); // anyone who's in can invite
+        let (mut dave, rd) = app(&addr, "dave", &code);
 
         alice
             .new_group("trip", vec!["bob".into(), "carol".into()])
@@ -957,6 +1056,35 @@ mod tests {
         until(&mut alice, &ra, |a| {
             group(a).unwrap().msgs.iter().any(|m| m.from == "dave")
         });
+
+        // bob selects dave's message (↑ from the bottom) and replies; alice sees the quote
+        let daves = group(&bob).unwrap().msgs.last().unwrap().id.clone();
+        bob.sel = bob.find(&gid).unwrap();
+        bob.focus = Focus::Messages;
+        press(&mut bob, KeyCode::Up);
+        assert_eq!(bob.msel.as_ref(), Some(&daves));
+        press(&mut bob, KeyCode::Char('r'));
+        assert!(bob.focus == Focus::Input && bob.reply_to.is_some());
+        bob.send_text("on my way".into());
+        until(&mut alice, &ra, |a| {
+            group(a).unwrap().msgs.iter().any(|m| m.from == "bob")
+        });
+        let r = group(&alice)
+            .unwrap()
+            .msgs
+            .iter()
+            .find(|m| m.from == "bob")
+            .unwrap()
+            .reply
+            .clone();
+        assert_eq!(
+            r,
+            Some(Quote {
+                id: daves,
+                from: "dave".into(),
+                text: "hey @bob".into()
+            })
+        );
 
         for a in [&alice, &bob, &carol, &dave] {
             fs::remove_dir_all(&a.dir).ok();

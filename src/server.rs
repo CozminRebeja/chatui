@@ -7,13 +7,43 @@ use std::sync::{Mutex, mpsc};
 use tungstenite::WebSocket;
 
 const MAX_QUEUE: usize = 5000;
+const MAX_INVITES: usize = 10; // unused ones per person
+const INVITE_DAYS: i64 = 7;
+/// No 0/O or 1/I/L, so codes survive being read out loud.
+const CODE_CHARS: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
-/// Persisted: who owns which name, and messages waiting for offline users.
-/// The server only ever sees ciphertext.
+/// Persisted: who owns which name, messages waiting for offline users, and
+/// unused invite codes. The server only ever sees ciphertext.
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct State {
     users: HashMap<String, Key>,
     queue: HashMap<String, Vec<Pkt>>,
+    invites: HashMap<String, Invite>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Invite {
+    by: String,
+    expires: chrono::DateTime<chrono::Utc>,
+}
+
+/// "abcde-fghjk" and "ABCDEFGHJK" are the same code.
+pub fn normalize_code(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+fn new_code() -> String {
+    let mut b = [0u8; 10];
+    OsRng.fill_bytes(&mut b);
+    let c: String = b
+        .iter()
+        .map(|x| CODE_CHARS[*x as usize % CODE_CHARS.len()] as char)
+        .collect();
+    format!("{}-{}", &c[..5], &c[5..])
 }
 
 struct Server {
@@ -119,11 +149,32 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
         return refuse(ws, "auth failed");
     }
     let (tx, rx) = mpsc::channel();
+    let mut inviter = String::new();
     {
         let mut s = srv.lock().unwrap();
         match s.state.users.get(&user) {
             Some(k) if *k != key => return refuse(ws, "username taken"),
             Some(_) => {}
+            // invite only: the first account (whoever runs the relay) is free,
+            // everyone after that needs a code from someone who's already in
+            None if !s.state.users.is_empty() => {
+                let now = chrono::Utc::now();
+                let code = normalize_code(&a.id);
+                match s.state.invites.remove(&code) {
+                    Some(i) if i.expires > now => {
+                        inviter = i.by;
+                        s.state.users.insert(user.clone(), key);
+                        s.save();
+                    }
+                    _ if a.id.is_empty() => {
+                        return refuse(
+                            ws,
+                            "this server is invite only: ask a friend on chatui for a code",
+                        );
+                    }
+                    _ => return refuse(ws, "that invite code is wrong, used or expired"),
+                }
+            }
             None => {
                 s.state.users.insert(user.clone(), key);
                 s.save();
@@ -133,6 +184,7 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
             &mut ws,
             &Pkt {
                 t: "ok".into(),
+                from: inviter,
                 ..Default::default()
             },
         );
@@ -178,6 +230,27 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                     t: "ack".into(),
                     id: p.id,
                     to: p.to,
+                    ..Default::default()
+                });
+            }
+            "invite" => {
+                let now = chrono::Utc::now();
+                s.state.invites.retain(|_, i| i.expires > now);
+                if s.state.invites.values().filter(|i| i.by == user).count() >= MAX_INVITES {
+                    let e = format!("you have {MAX_INVITES} unused invites already");
+                    let _ = tx.send(err_pkt(&e, &p.id));
+                    return;
+                }
+                let code = new_code();
+                let invite = Invite {
+                    by: user.clone(),
+                    expires: now + chrono::Duration::days(INVITE_DAYS),
+                };
+                s.state.invites.insert(normalize_code(&code), invite);
+                s.save();
+                let _ = tx.send(Pkt {
+                    t: "invite".into(),
+                    id: code,
                     ..Default::default()
                 });
             }

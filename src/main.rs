@@ -175,13 +175,15 @@ pub fn fingerprint(k: &Key) -> String {
         .join(" ")
 }
 
-/// Connect and prove we own `sk`. Returns the socket (logged in) and a handle to
-/// its TCP stream, for setting the read timeout before handing it to `pump`.
+/// Connect and prove we own `sk`; a new username also needs an `invite` code.
+/// Returns the socket (logged in), a handle to its TCP stream (for setting the read
+/// timeout before handing it to `pump`), and who invited us if we just signed up.
 pub fn handshake(
     server: &str,
     user: &str,
     sk: &SecretKey,
-) -> Result<(ClientWs, TcpStream), String> {
+    invite: &str,
+) -> Result<(ClientWs, TcpStream, String), String> {
     let (url, addr) = endpoint(server);
     // try every resolved address: .local names often resolve to IPv6 first
     let mut last = "bad server address".to_string();
@@ -211,6 +213,7 @@ pub fn handshake(
         user: user.into(),
         key: Some(sk.public_key().to_bytes()),
         data: proof,
+        id: invite.into(),
         ..Default::default()
     };
     if !send(&mut ws, &auth) {
@@ -220,7 +223,7 @@ pub fn handshake(
     if ok.t != "ok" {
         return Err(ok.err);
     }
-    Ok((ws, ctl))
+    Ok((ws, ctl, ok.from))
 }
 
 pub fn home() -> PathBuf {
@@ -333,18 +336,38 @@ mod tests {
         let state = dir.join("s.json");
         std::thread::spawn(move || server::serve(l, &state));
 
-        let (a, b, c) = (
+        let (a, b, c, d) = (
+            SecretKey::generate(&mut OsRng),
             SecretKey::generate(&mut OsRng),
             SecretKey::generate(&mut OsRng),
             SecretKey::generate(&mut OsRng),
         );
-        let (mut aw, _) = handshake(&addr, "alice", &a).unwrap();
-        let (mut bw, _) = handshake(&addr, "bob", &b).unwrap();
-        drop(handshake(&addr, "carol", &c).unwrap()); // register, then go offline
+        // the first account needs no invite, everyone after does
+        let (mut aw, _, by) = handshake(&addr, "alice", &a, "").unwrap();
+        assert_eq!(by, "");
+        assert_eq!(
+            handshake(&addr, "bob", &b, "").err().unwrap(),
+            "this server is invite only: ask a friend on chatui for a code"
+        );
+        let mut invite = || {
+            send_pkt(&mut aw, "invite", "", "", vec![]);
+            recv(&mut aw).unwrap().id
+        };
+        let (for_bob, for_carol) = (invite(), invite());
+        assert_eq!(
+            handshake(&addr, "bob", &b, "ZZZZZ-ZZZZZ").err().unwrap(),
+            "that invite code is wrong, used or expired"
+        );
+        // codes are case- and dash-insensitive, and single use
+        let (mut bw, _, by) =
+            handshake(&addr, "bob", &b, &for_bob.to_lowercase().replace('-', "")).unwrap();
+        assert_eq!(by, "alice");
+        assert!(handshake(&addr, "dave", &d, &for_bob).is_err());
+        drop(handshake(&addr, "carol", &c, &for_carol).unwrap()); // register, then go offline
 
         // someone else can't take alice's name
         assert_eq!(
-            handshake(&addr, "alice", &b).err().unwrap(),
+            handshake(&addr, "alice", &b, "").err().unwrap(),
             "username taken"
         );
 
@@ -363,7 +386,7 @@ mod tests {
         let carol = c.public_key().to_bytes();
         send_pkt(&mut aw, "send", "carol", "2", seal(&carol, &a, b"yo"));
         assert_eq!(recv(&mut aw).unwrap().id, "2");
-        let (mut cw, _) = handshake(&addr, "carol", &c).unwrap();
+        let (mut cw, _, _) = handshake(&addr, "carol", &c, "").unwrap();
         let m = recv(&mut cw).unwrap();
         assert_eq!(open(&m.key.unwrap(), &c, &m.data).unwrap(), b"yo");
 

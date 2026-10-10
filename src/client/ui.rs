@@ -42,6 +42,10 @@ pub enum Popup {
         focus: usize,
         err: String,
     },
+    /// Empty `code` while the server makes one.
+    Invite {
+        code: String,
+    },
     /// Moving the cursor previews the theme live; Esc goes back to the active one.
     Themes {
         names: Vec<String>,
@@ -229,6 +233,39 @@ fn input_row(
     field.render(f, r.inner(Margin::new(1, 0)), focused, placeholder);
 }
 
+fn base64(data: &[u8]) -> String {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for ch in data.chunks(3) {
+        let n = ch
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, &b)| a | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= ch.len() {
+                B64[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// System clipboard via OSC 52: most terminals, and tmux with set-clipboard on.
+fn copy(text: &str) {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).and_then(|_| out.flush());
+}
+
+fn invite_message(code: &str) -> String {
+    format!(
+        "Join me on chatui, an end-to-end encrypted terminal chat. Install it from {}#install, \
+         run chatui, pick a username and enter the invite code {code}",
+        env!("CARGO_PKG_REPOSITORY")
+    )
+}
+
 fn name_color(name: &str) -> Color {
     th().names[name
         .bytes()
@@ -309,7 +346,7 @@ impl App {
     /// First-run login: username + server, with instructions for finding both.
     fn draw_setup(&self, f: &mut Frame) {
         let Some(s) = &self.setup else { return };
-        let area = centered(f.area(), 74, 25);
+        let area = centered(f.area(), 74, 31);
         f.render_widget(Clear, area);
         let block = popup_block(
             "Welcome to chatui",
@@ -328,6 +365,10 @@ impl App {
             s_field,
             s_help,
             _,
+            i_label,
+            i_field,
+            i_help,
+            _,
             note,
             status,
         ] = Layout::vertical([
@@ -339,7 +380,11 @@ impl App {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(1),
@@ -402,6 +447,16 @@ impl App {
                 ]),
             ]),
             s_help,
+        );
+
+        f.render_widget(label("Invite code", s.focus == 2), i_label);
+        field(f, i_field, &s.invite, s.focus == 2, "e.g. 7KQ2M-XH4PD");
+        f.render_widget(
+            help(vec![Line::from(
+                "Get one from a friend who's already in (they press v). Leave it empty only \
+                 if you're the first person on a brand-new server.",
+            )]),
+            i_help,
         );
 
         f.render_widget(
@@ -548,8 +603,10 @@ impl App {
         out
     }
 
-    fn message_lines(&self, c: &Chat) -> Vec<Line<'static>> {
+    /// The timeline, and the line range of the selected message (if any).
+    fn message_lines(&self, c: &Chat) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let mut out = vec![];
+        let mut sel = None;
         let mut prev: Option<&Msg> = None;
         for m in &c.msgs {
             let local = m.ts.with_timezone(&Local);
@@ -572,6 +629,7 @@ impl App {
                 continue;
             }
             let mine = m.from == self.me;
+            let start = out.len();
             if new_day
                 || prev
                     .is_none_or(|p| p.from != m.from || m.ts - p.ts > chrono::Duration::minutes(5))
@@ -594,6 +652,20 @@ impl App {
                 ));
                 out.push(if mine { line.right_aligned() } else { line });
             }
+            let body = out.len();
+            if let Some(q) = &m.reply {
+                let (who, color) = if q.from == self.me {
+                    ("you".to_string(), th().accent)
+                } else {
+                    (q.from.clone(), name_color(&q.from))
+                };
+                let line = Line::from(vec![
+                    "↪ ".fg(th().dim),
+                    Span::styled(who, Style::new().fg(color)),
+                    format!(": {}", truncate(&q.text, 60)).fg(th().dim).italic(),
+                ]);
+                out.push(if mine { line.right_aligned() } else { line });
+            }
             let mut spans = self.text_spans(c, &m.text);
             spans.push(Span::raw("  "));
             spans.push(local.format("%H:%M").to_string().fg(th().dim));
@@ -610,9 +682,15 @@ impl App {
             }
             let line = Line::from(spans);
             out.push(if mine { line.right_aligned() } else { line });
+            if self.msel.as_ref() == Some(&m.id) {
+                for l in &mut out[body..] {
+                    l.style = l.style.bg(th().selected_bg);
+                }
+                sel = Some((start, out.len()));
+            }
             prev = Some(m);
         }
-        out
+        (out, sel)
     }
 
     fn draw_messages(&mut self, f: &mut Frame, area: Rect) {
@@ -661,16 +739,31 @@ impl App {
             ]);
             return f.render_widget(hi, inner);
         }
-        let lines = self.message_lines(c);
+        let (lines, sel) = self.message_lines(c);
         let text_area = Rect {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let max = p
-            .line_count(text_area.width)
-            .saturating_sub(inner.height as usize);
+        let rows = |ls: &[Line<'static>]| {
+            Paragraph::new(ls.to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(text_area.width)
+        };
+        let max = rows(&lines).saturating_sub(inner.height as usize);
         self.scroll = self.scroll.min(max);
+        // keep the selected message on screen
+        if let Some((a, b)) = sel {
+            let (top, bottom, h) = (rows(&lines[..a]), rows(&lines[..b]), inner.height as usize);
+            let mut y = max - self.scroll;
+            if bottom > y + h {
+                y = bottom - h;
+            }
+            if top < y {
+                y = top;
+            }
+            self.scroll = max - y.min(max);
+        }
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         let y = max - self.scroll;
         f.render_widget(p.scroll((y as u16, 0)), text_area);
         if max > 0 {
@@ -685,9 +778,17 @@ impl App {
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Input && self.popup.is_none();
-        let title = match self.store.chats.get(self.sel) {
-            Some(c) => format!(" Message {}{} ", if c.group { "#" } else { "@" }, c.name),
-            None => " Message ".into(),
+        let title = match (self.store.chats.get(self.sel), &self.reply_to) {
+            (Some(_), Some(q)) => {
+                let who = if q.from == self.me {
+                    "yourself"
+                } else {
+                    &q.from
+                };
+                format!(" Reply to {who}: {} · Esc cancels ", truncate(&q.text, 30))
+            }
+            (Some(c), None) => format!(" Message {}{} ", if c.group { "#" } else { "@" }, c.name),
+            (None, _) => " Message ".into(),
         };
         let block = pane(title, focused);
         let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -794,14 +895,16 @@ impl App {
                 ("f", "add friend"),
                 ("g", "new group"),
                 ("+", "add to group"),
+                ("v", "invite"),
                 ("i", "info"),
                 ("d", "remove"),
                 ("t", "theme"),
                 ("q", "quit"),
             ],
             Focus::Messages => &[
-                ("↑↓", "scroll"),
-                ("PgUp/PgDn", "page"),
+                ("↑↓", "select"),
+                ("r", "reply"),
+                ("PgUp/PgDn", "scroll"),
                 ("End", "latest"),
                 ("Esc", "back"),
                 ("Tab", "next pane"),
@@ -830,7 +933,8 @@ impl App {
                 let text = vec![
                     head("Moving around"),
                     key("Tab / Shift-Tab", "switch between chats, messages, input"),
-                    key("↑ ↓  or  j k", "select chat / scroll messages"),
+                    key("↑ ↓  or  j k", "select a chat / a message"),
+                    key("r", "reply to the selected message"),
                     key("Enter", "open chat / send message"),
                     key("Ctrl-N / Ctrl-P", "next / previous chat while typing"),
                     key("PgUp / PgDn", "scroll messages"),
@@ -838,6 +942,7 @@ impl App {
                     Line::default(),
                     head("Friends & groups"),
                     key("f", "add a friend (their username)"),
+                    key("v", "invite someone new (code)"),
                     key("g", "new group (3+ people)"),
                     key("+", "add people to the open group"),
                     key("@name", "mention someone (Tab completes)"),
@@ -1165,6 +1270,50 @@ impl App {
                     r_err,
                 );
             }
+            Some(Popup::Invite { code }) => {
+                let area = centered(screen, 64, 13);
+                f.render_widget(Clear, area);
+                let block = popup_block(
+                    "Invite a friend",
+                    &[("c", "copy message"), ("Esc", "close")],
+                );
+                let inner = block.inner(area).inner(Margin::new(2, 1));
+                f.render_widget(block, area);
+                let [r_code, r_note, _, r_msg] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .areas(inner);
+                let row = |label: &str, v: Span<'static>| {
+                    Line::from(vec![format!("{label:<10}").fg(th().muted), v])
+                };
+                if code.is_empty() {
+                    return f.render_widget(row("Code", "creating…".fg(th().warn)), r_code);
+                }
+                if let Some(e) = code.strip_prefix("error: ") {
+                    return f.render_widget(
+                        Paragraph::new(e.to_string())
+                            .fg(th().error)
+                            .wrap(Wrap { trim: true }),
+                        r_code,
+                    );
+                }
+                f.render_widget(row("Code", code.clone().bold().fg(th().accent)), r_code);
+                f.render_widget(
+                    row("", "single use · expires in 7 days".fg(th().dim)),
+                    r_note,
+                );
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from("Send them this:").fg(th().muted),
+                        Line::from(invite_message(code)),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    r_msg,
+                );
+            }
             Some(Popup::Themes { names, cursor }) => {
                 let list_h = names.len().min(12) as u16;
                 let area = centered(screen, 52, list_h + 7);
@@ -1231,14 +1380,15 @@ impl App {
         }
         match k.code {
             KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => s.focus = 1 - s.focus,
+            KeyCode::Tab | KeyCode::Down => s.focus = (s.focus + 1) % 3,
+            KeyCode::BackTab | KeyCode::Up => s.focus = (s.focus + 2) % 3,
             KeyCode::Enter if s.focus == 0 && s.server.text.trim().is_empty() => s.focus = 1,
             KeyCode::Enter => (s.busy, s.err) = (true, "connecting…".into()),
             _ => {
-                let field = if s.focus == 0 {
-                    &mut s.user
-                } else {
-                    &mut s.server
+                let field = match s.focus {
+                    0 => &mut s.user,
+                    1 => &mut s.server,
+                    _ => &mut s.invite,
                 };
                 field.edit(k);
             }
@@ -1306,6 +1456,7 @@ impl App {
             KeyCode::Char('+') => {
                 self.notify("open a group first, then press + to add people", true)
             }
+            KeyCode::Char('v') => self.create_invite(),
             KeyCode::Char('t') => {
                 let names = theme::list(&self.dir);
                 let active = theme::active_name(&self.dir);
@@ -1340,15 +1491,61 @@ impl App {
         }
     }
 
+    /// Step the message selection; past the newest message it clears.
+    fn move_sel(&mut self, up: bool) {
+        let Some(c) = self.store.chats.get(self.sel) else {
+            return;
+        };
+        let ids: Vec<&String> = c
+            .msgs
+            .iter()
+            .filter(|m| !m.from.is_empty())
+            .map(|m| &m.id)
+            .collect();
+        let at = self
+            .msel
+            .as_ref()
+            .and_then(|id| ids.iter().position(|x| *x == id));
+        let next = match (at, up) {
+            (None, true) => ids.len().checked_sub(1),
+            (None, false) => None,
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) => Some(i + 1).filter(|&j| j < ids.len()),
+        };
+        self.msel = next.map(|i| ids[i].clone());
+        if self.msel.is_none() {
+            self.scroll = 0;
+        }
+    }
+
     fn key_messages(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Home => self.scroll = usize::MAX, // clamped when drawn
-            KeyCode::End => self.scroll = 0,
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Chats,
+            KeyCode::Up | KeyCode::Char('k') => self.move_sel(true),
+            KeyCode::Down | KeyCode::Char('j') => self.move_sel(false),
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                self.msel = None;
+                self.scroll = match k.code {
+                    KeyCode::PageUp => self.scroll.saturating_add(10),
+                    KeyCode::PageDown => self.scroll.saturating_sub(10),
+                    KeyCode::Home => usize::MAX, // clamped when drawn
+                    _ => 0,
+                };
+            }
+            KeyCode::Char('r') | KeyCode::Enter => {
+                let c = self.store.chats.get(self.sel);
+                let m = c.and_then(|c| c.msgs.iter().find(|m| Some(&m.id) == self.msel.as_ref()));
+                if let Some(m) = m {
+                    self.reply_to = Some(Quote::of(m));
+                    self.msel = None;
+                    self.scroll = 0;
+                    self.focus = Focus::Input;
+                }
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                if self.msel.take().is_none() {
+                    self.focus = Focus::Chats;
+                }
+            }
             _ => self.key_common(k),
         }
     }
@@ -1367,6 +1564,7 @@ impl App {
             }
         }
         match k.code {
+            KeyCode::Esc if self.reply_to.is_some() => self.reply_to = None,
             KeyCode::Esc => self.focus = Focus::Chats,
             KeyCode::Tab => self.cycle_focus(false),
             KeyCode::BackTab => self.cycle_focus(true),
@@ -1518,6 +1716,15 @@ impl App {
                 }
                 true
             }
+            Popup::Invite { code } => match k.code {
+                KeyCode::Char('c') | KeyCode::Enter if code.len() == 11 => {
+                    copy(&invite_message(code));
+                    self.notify("copied — paste it to your friend", false);
+                    false
+                }
+                KeyCode::Esc | KeyCode::Char('q' | 'v') => false,
+                _ => true,
+            },
             Popup::Themes { names, cursor } => {
                 let pick = |c: usize| names.get(c).cloned().unwrap_or_default();
                 match k.code {
@@ -1563,8 +1770,14 @@ impl App {
             r.input.contains(pos),
         );
         match m.kind {
-            MouseEventKind::ScrollUp if in_msgs => self.scroll = self.scroll.saturating_add(3),
-            MouseEventKind::ScrollDown if in_msgs => self.scroll = self.scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp if in_msgs => {
+                self.msel = None;
+                self.scroll = self.scroll.saturating_add(3)
+            }
+            MouseEventKind::ScrollDown if in_msgs => {
+                self.msel = None;
+                self.scroll = self.scroll.saturating_sub(3)
+            }
             MouseEventKind::ScrollUp if in_list => self.select(self.sel.saturating_sub(1)),
             MouseEventKind::ScrollDown if in_list => self.select(self.sel + 1),
             MouseEventKind::Down(MouseButton::Left) if in_list => {
@@ -1576,5 +1789,17 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) if in_input => self.focus = Focus::Input,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64() {
+        let enc = |s: &str| super::base64(s.as_bytes());
+        assert_eq!(
+            [enc("Man"), enc("Ma"), enc("M"), enc("")],
+            ["TWFu", "TWE=", "TQ==", ""]
+        );
     }
 }
