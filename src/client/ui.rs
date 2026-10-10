@@ -284,8 +284,16 @@ fn name_color(name: &str) -> Color {
         % 6]
 }
 
+/// Local time for display. chrono panics converting times near its limits, and anyone can
+/// send such a time, so clamp to a range that always converts.
+fn local(ts: DateTime<Utc>) -> DateTime<Local> {
+    let lo = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+    let hi = DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z").unwrap();
+    ts.clamp(lo, hi.with_timezone(&Utc)).with_timezone(&Local)
+}
+
 fn short_time(ts: DateTime<Utc>) -> String {
-    let t = ts.with_timezone(&Local);
+    let t = local(ts);
     let days = (Local::now().date_naive() - t.date_naive()).num_days();
     match days {
         0 => t.format("%H:%M").to_string(),
@@ -624,15 +632,15 @@ impl App {
         let mut sel = None;
         let mut prev: Option<&Msg> = None;
         for m in &c.msgs {
-            let local = m.ts.with_timezone(&Local);
+            let when = local(m.ts);
             let new_day =
-                prev.is_none_or(|p| p.ts.with_timezone(&Local).date_naive() != local.date_naive());
+                prev.is_none_or(|p| local(p.ts).date_naive() != when.date_naive());
             if new_day {
                 if !out.is_empty() {
                     out.push(Line::default());
                 }
                 out.push(
-                    Line::from(format!("── {} ──", day_label(local)))
+                    Line::from(format!("── {} ──", day_label(when)))
                         .fg(th().dim)
                         .centered(),
                 );
@@ -686,7 +694,7 @@ impl App {
             }
             let mut spans = self.text_spans(c, &m.text);
             spans.push(Span::raw("  "));
-            spans.push(local.format("%H:%M").to_string().fg(th().dim));
+            spans.push(when.format("%H:%M").to_string().fg(th().dim));
             if mine {
                 let n = c.members.len();
                 spans.push(match m.status {
@@ -1980,6 +1988,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn base64() {
         let enc = |s: &str| super::base64(s.as_bytes());
@@ -1987,5 +1997,18 @@ mod tests {
             [enc("Man"), enc("Ma"), enc("M"), enc("")],
             ["TWFu", "TWE=", "TQ==", ""]
         );
+    }
+
+    /// A stranger can send any timestamp, and chrono panics converting some of them to local time.
+    #[test]
+    fn extreme_times_do_not_crash_display() {
+        for ts in [DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MIN_UTC] {
+            let _ = local(ts);
+            let _ = short_time(ts);
+            let _ = day_label(local(ts));
+        }
+        // ordinary times are shown unchanged
+        let t = DateTime::parse_from_rfc3339("2026-10-10T08:57:04Z").unwrap().with_timezone(&Utc);
+        assert_eq!(local(t), t.with_timezone(&Local));
     }
 }
