@@ -381,7 +381,8 @@ const USAGE: &str = "usage:
   chatui mcp                     MCP server so an AI can design themes
                                  (claude mcp add chatui -- chatui mcp)
   chatui backup <file>           save your account (encrypted; chats not included)
-  chatui restore <file>          put a saved account back [--force to replace]";
+  chatui restore <file>          put a saved account back [--force to replace]
+  chatui --version               print the version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -401,6 +402,7 @@ fn main() {
         ["serve", "--release", u] => server::release_cmd(&home().join("server.json"), u).map(say),
         ["serve", addr] => serve(Some(*addr), None),
         ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
+        ["--version"] | ["-V"] => Ok(println!("chatui {}", env!("CARGO_PKG_VERSION"))),
         ["mcp"] => mcp::run(),
         ["backup", file] => backup::backup(&home(), Path::new(file))
             .map(|_| println!("saved to {file}; keep it private, and remember your passphrase")),
@@ -766,5 +768,174 @@ mod tests {
         let eof = closed || c.read_to_end(&mut rest).is_ok();
         assert!(eof && start.elapsed() < Duration::from_secs(4));
         fs::remove_dir_all(dir).ok();
+    }
+
+    /// A relay on a free port, with its state in a temp folder.
+    fn test_server(name: &str) -> (String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chatui-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let state = dir.join("s.json");
+        std::thread::spawn(move || server::serve(l, &state));
+        (addr, dir)
+    }
+
+    /// Opens a socket without logging in; returns it with the server's challenge.
+    fn raw(addr: &str) -> (WebSocket<TcpStream>, Pkt) {
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (mut ws, _) = tungstenite::client(format!("ws://{addr}"), tcp).unwrap();
+        let c = recv(&mut ws).unwrap();
+        (ws, c)
+    }
+
+    /// A login packet that proves `sk` for the challenge `c`.
+    fn login(user: &str, sk: &SecretKey, c: &Pkt) -> Pkt {
+        Pkt {
+            t: "auth".into(),
+            user: user.into(),
+            key: Some(sk.public_key().to_bytes()),
+            data: seal(&c.key.unwrap(), sk, &[AUTH_PREFIX, &c.data].concat()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn forged_login_is_refused() {
+        let (addr, dir) = test_server("forged");
+        let (alice, mallory) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        drop(handshake(&addr, "alice", &alice, "").unwrap());
+
+        // claims alice's key, but the proof is sealed with mallory's
+        let (mut ws, c) = raw(&addr);
+        let mut p = login("alice", &alice, &c);
+        p.data = seal(&c.key.unwrap(), &mallory, &[AUTH_PREFIX, &c.data].concat());
+        assert!(send(&mut ws, &p));
+        assert_eq!(recv(&mut ws).unwrap().err, "auth failed");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn replayed_login_is_refused() {
+        let (addr, dir) = test_server("replay");
+        let alice = SecretKey::generate(&mut OsRng);
+        drop(handshake(&addr, "alice", &alice, "").unwrap());
+
+        // a valid login from one connection...
+        let (mut first, c1) = raw(&addr);
+        let captured = login("alice", &alice, &c1);
+        assert!(send(&mut first, &captured));
+        assert_eq!(recv(&mut first).unwrap().t, "ok");
+
+        // ...sent again on a new connection, which has its own challenge
+        let (mut second, _) = raw(&addr);
+        assert!(send(&mut second, &captured));
+        assert_eq!(recv(&mut second).unwrap().err, "auth failed");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sender_name_is_set_by_server() {
+        let (addr, dir) = test_server("spoof");
+        let (a, b, m) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        let mut aw = handshake(&addr, "alice", &a, "").unwrap().ws;
+        send_pkt(&mut aw, "invite", "", "", vec![]);
+        let bob_code = recv(&mut aw).unwrap().id;
+        send_pkt(&mut aw, "invite", "", "", vec![]);
+        let mallory_code = recv(&mut aw).unwrap().id;
+        let mut bw = handshake(&addr, "bob", &b, &bob_code).unwrap().ws;
+        let mut mw = handshake(&addr, "mallory", &m, &mallory_code).unwrap().ws;
+
+        // mallory claims the message is from alice
+        assert!(send(
+            &mut mw,
+            &Pkt {
+                t: "send".into(),
+                to: "bob".into(),
+                id: "1".into(),
+                from: "alice".into(),
+                data: seal(&b.public_key().to_bytes(), &m, b"pay me"),
+                ..Default::default()
+            }
+        ));
+        let got = recv(&mut bw).unwrap();
+        assert_eq!(got.from, "mallory");
+        assert_eq!(got.key, Some(m.public_key().to_bytes()));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn oversized_frame_drops_connection() {
+        let (addr, dir) = test_server("oversize");
+        let a = SecretKey::generate(&mut OsRng);
+        let (mut ws, c) = raw(&addr);
+        assert!(send(&mut ws, &login("alice", &a, &c)));
+        assert_eq!(recv(&mut ws).unwrap().t, "ok");
+
+        // frames are capped well below 2 MB; a bigger one must end the connection
+        let _ = ws.send(Message::text("x".repeat(2 << 20)));
+        assert!(recv(&mut ws).is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sending_to_unknown_user_is_an_error() {
+        let (addr, dir) = test_server("unknown");
+        let a = SecretKey::generate(&mut OsRng);
+        let mut aw = handshake(&addr, "alice", &a, "").unwrap().ws;
+        send_pkt(
+            &mut aw,
+            "send",
+            "ghost",
+            "9",
+            seal(&a.public_key().to_bytes(), &a, b"hello?"),
+        );
+        let r = recv(&mut aw).unwrap();
+        assert_eq!(
+            (r.t.as_str(), r.err.as_str()),
+            ("err", "unknown user ghost")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn seal_and_open_reject_wrong_or_tampered_data() {
+        let (a, b, c) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        let (a_pub, b_pub, c_pub) = (
+            a.public_key().to_bytes(),
+            b.public_key().to_bytes(),
+            c.public_key().to_bytes(),
+        );
+        let ct = seal(&b_pub, &a, b"secret");
+        assert_eq!(open(&a_pub, &b, &ct).unwrap(), b"secret");
+
+        assert!(open(&a_pub, &c, &ct).is_none(), "wrong recipient");
+        assert!(open(&c_pub, &b, &ct).is_none(), "wrong claimed sender");
+
+        let mut bad = ct.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(open(&a_pub, &b, &bad).is_none(), "tampered");
+        assert!(open(&a_pub, &b, &ct[..10]).is_none(), "truncated");
+    }
+
+    #[test]
+    fn usernames_are_restricted() {
+        assert!(valid_name("alice_1-x"));
+        assert!(valid_name(&"a".repeat(20)));
+        for bad in ["", &"a".repeat(21), "a b", "../x", "a/b", "é", "a\n"] {
+            assert!(!valid_name(bad), "{bad:?} should be refused");
+        }
     }
 }
