@@ -1,6 +1,6 @@
 [package]
 name = "chatui"
-version = "0.9.12"
+version = "0.9.13"
 edition = "2024"
 description = "Tiny end-to-end encrypted terminal chat"
 repository = "https://github.com/CozminRebeja/chatui"
