@@ -19,6 +19,15 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
   can read your chats.
 - **Unverified contacts.** Until you compare safety numbers, a relay could
   substitute keys for a first contact.
+- **Group admin rules are enforced by each member's app.** They aren't backed by
+  signed group records. A member who hasn't yet received a grant may ignore a
+  removal, and an invitee takes the admin's name from the person who invited
+  them, so a malicious member could claim a false admin. Groups made before
+  admins existed have none, so nobody can remove people from them. The admin
+  can't leave or hand over the role yet.
+- **Notifications on screen.** `/notify` shows the sender and the first 100
+  characters of a message on your desktop, where anyone looking at the screen
+  can see them.
 
 ## Reporting a problem
 
