@@ -613,6 +613,40 @@ impl App {
         }
     }
 
+    fn rename_group(&mut self, name: &str) -> Result<(), String> {
+        let name = clean(name.trim());
+        if name.is_empty() {
+            return Err("give the group a name".into());
+        }
+        if name.chars().count() > 40 {
+            return Err("keep it to 40 characters".into());
+        }
+        let Some(c) = self.store.chats.get(self.sel).filter(|c| c.group) else {
+            return Err("that group is gone".into());
+        };
+        if c.name == name {
+            return Ok(());
+        }
+        if self.conn.is_none() {
+            return Err("offline — try again when connected".into());
+        }
+        let p = Payload {
+            t: "rename".into(),
+            chat: c.id.clone(),
+            name: name.clone(),
+            ..Default::default()
+        };
+        for u in c.members.clone() {
+            self.send_to(&u, "", &p);
+        }
+        let c = &mut self.store.chats[self.sel];
+        c.name = name.clone();
+        c.msgs
+            .push(notice(format!("you renamed the group to {name}")));
+        self.commit();
+        Ok(())
+    }
+
     fn create_invite(&mut self) {
         if self.write(&Pkt {
             t: "invite".into(),
@@ -888,6 +922,18 @@ impl App {
                 self.add_chat(c);
                 self.notify(format!("{from} added you to a group"), false);
             }
+            "rename" => {
+                let Some(ci) = self.find(&m.chat) else { return };
+                let c = &mut self.store.chats[ci];
+                let name: String = clean(m.name.trim()).chars().take(40).collect();
+                // only someone in the group can rename it
+                if !c.group || !c.members.contains(&from) || name.is_empty() || name == c.name {
+                    return;
+                }
+                c.msgs
+                    .push(notice(format!("{from} renamed the group to {name}")));
+                c.name = name;
+            }
             "add" => {
                 let Some(ci) = self.find(&m.chat) else { return };
                 let c = &self.store.chats[ci];
@@ -1085,6 +1131,15 @@ mod tests {
                 text: "hey @bob".into()
             })
         );
+
+        // any member can rename the group, everyone follows
+        assert!(bob.rename_group("  ").is_err());
+        bob.rename_group("road trip").unwrap();
+        for (a, r) in [(&mut alice, &ra), (&mut dave, &rd)] {
+            until(a, r, |a| group(a).unwrap().name == "road trip");
+            let last = &group(a).unwrap().msgs.last().unwrap().text;
+            assert_eq!(last, "bob renamed the group to road trip");
+        }
 
         for a in [&alice, &bob, &carol, &dave] {
             fs::remove_dir_all(&a.dir).ok();

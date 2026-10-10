@@ -41,11 +41,11 @@ Whoever invited you shows up as your first chat.
 | --- | --- |
 | `f` | add a friend by username |
 | `v` | invite someone new (`c` copies a message to send them) |
-| `g` / `+` | new group / add people to the open group |
+| `g` / `+` / `e` | new group / add people to the open group / rename it |
 | `@name` | mention someone (Tab completes) |
 | `↑↓` then `r` | in the message pane: pick a message and reply to it |
 | `i` | members and key fingerprints, to compare in person |
-| `t` | pick a theme |
+| `t` or Ctrl-T | pick a theme: default, dracula, gruvbox, nord, solarized, synthwave, or your own |
 | `?` | everything else |
 
 ## Themes, made by AI

@@ -42,6 +42,11 @@ pub enum Popup {
         focus: usize,
         err: String,
     },
+    /// New name for the open group.
+    Rename {
+        name: Field,
+        err: String,
+    },
     /// Empty `code` while the server makes one.
     Invite {
         code: String,
@@ -945,13 +950,14 @@ impl App {
                     key("v", "invite someone new (code)"),
                     key("g", "new group (3+ people)"),
                     key("+", "add people to the open group"),
+                    key("e", "rename the open group"),
                     key("@name", "mention someone (Tab completes)"),
                     key("i", "members & key fingerprints"),
                     key("d", "remove friend / group from this device"),
                     key("a", "account & server"),
                     Line::default(),
                     head("Themes"),
-                    key("t", "pick a theme"),
+                    key("t  or  Ctrl-T", "pick a theme (Ctrl-T works while typing)"),
                     Line::from(vec![
                         "  Have an AI make one: ".into(),
                         "claude mcp add chatui -- chatui mcp".fg(th().accent),
@@ -1033,8 +1039,15 @@ impl App {
                 f.render_widget(Clear, area);
                 f.render_widget(
                     Paragraph::new(text).block(
-                        popup_block("Chat info", &[("Esc", "close")])
-                            .padding(ratatui::widgets::Padding::uniform(1)),
+                        popup_block(
+                            "Chat info",
+                            if c.group {
+                                &[("e", "rename"), ("+", "add people"), ("Esc", "close")]
+                            } else {
+                                &[("Esc", "close")]
+                            },
+                        )
+                        .padding(ratatui::widgets::Padding::uniform(1)),
                     ),
                     area,
                 );
@@ -1270,6 +1283,16 @@ impl App {
                     r_err,
                 );
             }
+            Some(Popup::Rename { name, err }) => {
+                let area = centered(screen, 56, 7);
+                f.render_widget(Clear, area);
+                let block = popup_block("Rename group", &[("⏎", "rename"), ("Esc", "cancel")]);
+                let inner = block.inner(area).inner(Margin::new(2, 1));
+                f.render_widget(block, area);
+                let rows = Layout::vertical([Constraint::Length(1); 3]).split(inner);
+                input_row(f, rows[0], "Name", name, true, "e.g. weekend plans");
+                f.render_widget(Line::from(err.as_str()).fg(th().error), rows[2]);
+            }
             Some(Popup::Invite { code }) => {
                 let area = centered(screen, 64, 13);
                 f.render_widget(Clear, area);
@@ -1334,10 +1357,19 @@ impl App {
                 let items: Vec<ListItem> = names
                     .iter()
                     .map(|n| {
-                        ListItem::new(Line::from(vec![
+                        let mut spans = vec![
                             (if *n == active { " ● " } else { "   " }).fg(th().accent),
-                            n.clone().into(),
-                        ]))
+                            format!("{n:<21}").into(),
+                        ];
+                        // a swatch of the theme's own colors, on its own background
+                        if let Ok(t) = theme::load(&self.dir, n) {
+                            let on = Style::new().bg(t.bg);
+                            for c in [t.accent, t.mention, t.ok, t.error, t.names[0], t.names[1]] {
+                                spans.push(Span::styled(" ●", on.fg(c)));
+                            }
+                            spans.push(Span::styled(" ", on));
+                        }
+                        ListItem::new(Line::from(spans))
                     })
                     .collect();
                 let mut st = ratatui::widgets::ListState::default().with_selected(Some(*cursor));
@@ -1456,13 +1488,15 @@ impl App {
             KeyCode::Char('+') => {
                 self.notify("open a group first, then press + to add people", true)
             }
-            KeyCode::Char('v') => self.create_invite(),
-            KeyCode::Char('t') => {
-                let names = theme::list(&self.dir);
-                let active = theme::active_name(&self.dir);
-                let cursor = names.iter().position(|n| *n == active).unwrap_or(0);
-                self.popup = Some(Popup::Themes { names, cursor });
+            KeyCode::Char('e') if self.store.chats.get(self.sel).is_some_and(|c| c.group) => {
+                let name = Field::from(self.store.chats[self.sel].name.as_str());
+                self.popup = Some(Popup::Rename {
+                    name,
+                    err: String::new(),
+                });
             }
+            KeyCode::Char('v') => self.create_invite(),
+            KeyCode::Char('t') => self.open_themes(),
             KeyCode::Char('i') if has_chat => self.popup = Some(Popup::Info),
             KeyCode::Char('d') if has_chat => self.popup = Some(Popup::Delete),
             KeyCode::Char('a') => {
@@ -1474,6 +1508,13 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
+    }
+
+    fn open_themes(&mut self) {
+        let names = theme::list(&self.dir);
+        let active = theme::active_name(&self.dir);
+        let cursor = names.iter().position(|n| *n == active).unwrap_or(0);
+        self.popup = Some(Popup::Themes { names, cursor });
     }
 
     fn key_chats(&mut self, k: KeyEvent) {
@@ -1570,6 +1611,7 @@ impl App {
             KeyCode::BackTab => self.cycle_focus(true),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Char('t') if ctrl(k) => self.open_themes(),
             KeyCode::Char('n') if ctrl(k) => self.select(self.sel + 1),
             KeyCode::Char('p') if ctrl(k) => self.select(self.sel.saturating_sub(1)),
             KeyCode::Enter => {
@@ -1598,6 +1640,10 @@ impl App {
                     self.quit = k.code == KeyCode::Char('q');
                     false
                 }
+            }
+            // e and + jump straight to renaming / adding people
+            Popup::Info if matches!(k.code, KeyCode::Char('e' | '+')) => {
+                return self.key_common(k);
             }
             Popup::Info => !matches!(
                 k.code,
@@ -1716,6 +1762,20 @@ impl App {
                 }
                 true
             }
+            Popup::Rename { name, err } => match k.code {
+                KeyCode::Esc => false,
+                KeyCode::Enter => match self.rename_group(&name.text) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        *err = e;
+                        true
+                    }
+                },
+                _ => {
+                    name.edit(k);
+                    true
+                }
+            },
             Popup::Invite { code } => match k.code {
                 KeyCode::Char('c') | KeyCode::Enter if code.len() == 11 => {
                     copy(&invite_message(code));

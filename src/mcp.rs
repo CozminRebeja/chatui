@@ -9,7 +9,9 @@ const INSTRUCTIONS: &str = "chatui is an end-to-end encrypted terminal chat app.
 design its color themes. Pick a cohesive palette with readable contrast: text, muted and dim \
 against bg, and on_accent against accent. bg \"reset\" keeps the user's terminal background; \
 if you set bg, also set text, selected_bg and field_bg to suit it. A running chatui switches \
-to a newly activated theme within a second.";
+to a newly activated theme within a second. Built-in themes (default, dracula, gruvbox, \
+nord, solarized, synthwave) can't be overwritten, but get_theme on one is a good starting point \
+for a new theme under another name.";
 
 pub fn run() -> Result<(), String> {
     let dir = home();
