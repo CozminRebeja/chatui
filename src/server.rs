@@ -1,7 +1,7 @@
 use crate::*;
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
@@ -9,6 +9,9 @@ use tungstenite::WebSocket;
 
 const MAX_QUEUE: usize = 5000;
 const MAX_INBOX_BYTES: usize = 8 << 20; // ciphertext waiting for one offline user
+/// Sends per sender per minute, so one account can't fill an offline inbox in seconds.
+const MAX_SENDS_TO_ONE: usize = 60; // to one person
+const MAX_SENDS: usize = 300; // to everyone
 const MAX_CONNS: usize = 512;
 const MAX_LOGINS: usize = 64; // connections that haven't logged in yet
 const MAX_KEYS: usize = 256; // users per key lookup
@@ -75,6 +78,7 @@ struct Server {
     online: HashMap<String, (u64, mpsc::Sender<Pkt>)>,
     path: PathBuf,
     dirty: bool, // queue changed since the last save
+    sent: HashMap<String, VecDeque<(Instant, String)>>, // each user's sends in the last minute; not saved
 }
 
 impl Server {
@@ -266,6 +270,7 @@ pub fn serve(l: TcpListener, path: &Path) {
         online: HashMap::new(),
         path: path.into(),
         dirty: false,
+        sent: HashMap::new(),
     })));
     // offline messages are saved in batches, so a burst of them isn't a burst of rewrites
     std::thread::spawn(|| {
@@ -436,6 +441,21 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
                     let _ = tx.send(err_pkt("message too big", &p.id));
                     return;
                 }
+                let now = Instant::now();
+                let sent = s.sent.entry(user.clone()).or_default();
+                while sent
+                    .front()
+                    .is_some_and(|(t, _)| now - *t >= Duration::from_secs(60))
+                {
+                    sent.pop_front();
+                }
+                if sent.len() >= MAX_SENDS
+                    || sent.iter().filter(|(_, to)| *to == p.to).count() >= MAX_SENDS_TO_ONE
+                {
+                    let _ = tx.send(err_pkt("slow down", &p.id));
+                    return;
+                }
+                sent.push_back((now, p.to.clone()));
                 let out = Pkt {
                     t: "msg".into(),
                     from: user.clone(),
@@ -617,6 +637,7 @@ mod tests {
             online: HashMap::new(),
             path: PathBuf::from("unused"),
             dirty: false,
+            sent: HashMap::new(),
         });
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = relay_state(&m);

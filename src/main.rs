@@ -497,7 +497,7 @@ mod tests {
             send_pkt(&mut aw, "invite", "", "", vec![]);
             recv(&mut aw).unwrap().id
         };
-        let (for_bob, for_carol) = (invite(), invite());
+        let (for_bob, for_carol, for_dave) = (invite(), invite(), invite());
         assert_eq!(
             handshake(&addr, "bob", &b, "ZZZZZ-ZZZZZ").err().unwrap(),
             "that invite code is wrong, used or expired"
@@ -553,18 +553,62 @@ mod tests {
         send_pkt(&mut aw, "send", "bob", "3", vec![0; MAX_DATA + 1]);
         assert_eq!(recv(&mut aw).unwrap().err, "message too big");
 
-        // an offline inbox is capped in bytes, not just messages
+        // an offline inbox is capped in bytes, not just messages; filling it
+        // takes a few senders, since each gets only so many sends a minute
         drop(cw);
+        let mut dw = handshake(&addr, "dave", &d, &for_dave).unwrap().ws;
         std::thread::sleep(Duration::from_millis(300));
         let mut last = Pkt::default();
-        for i in 0..200 {
-            send_pkt(&mut aw, "send", "carol", &i.to_string(), vec![0; MAX_DATA]);
-            last = recv(&mut aw).unwrap();
-            if last.t == "err" {
-                break;
+        'fill: for ws in [&mut aw, &mut bw, &mut dw] {
+            for i in 0..200 {
+                send_pkt(ws, "send", "carol", &i.to_string(), vec![0; MAX_DATA]);
+                last = recv(ws).unwrap();
+                match last.err.as_str() {
+                    "" => {}
+                    "slow down" => break,
+                    _ => break 'fill,
+                }
             }
         }
         assert_eq!(last.err, "carol's inbox is full");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn send_rate_limit() {
+        let dir = std::env::temp_dir().join(format!("chatui-rate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let state = dir.join("s.json");
+        std::thread::spawn(move || server::serve(l, &state));
+
+        let a = SecretKey::generate(&mut OsRng);
+        let mut aw = handshake(&addr, "alice", &a, "").unwrap().ws;
+        let names = ["u1", "u2", "u3", "u4", "u5", "u6"];
+        for name in names {
+            send_pkt(&mut aw, "invite", "", "", vec![]);
+            let code = recv(&mut aw).unwrap().id;
+            let k = SecretKey::generate(&mut OsRng);
+            drop(handshake(&addr, name, &k, &code).unwrap()); // offline from here on
+        }
+        let mut send_to = |to: &str| {
+            send_pkt(&mut aw, "send", to, "", vec![1]);
+            recv(&mut aw).unwrap()
+        };
+
+        // 60 a minute to one person...
+        for _ in 0..60 {
+            assert_eq!(send_to("u1").t, "ack");
+        }
+        assert_eq!(send_to("u1").err, "slow down");
+        // ...and 300 a minute in all
+        for to in &names[1..5] {
+            for _ in 0..60 {
+                assert_eq!(send_to(to).t, "ack");
+            }
+        }
+        assert_eq!(send_to("u6").err, "slow down");
         fs::remove_dir_all(dir).ok();
     }
 
