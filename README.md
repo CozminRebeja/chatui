@@ -72,15 +72,19 @@ Type these in the message box:
 | `/accept <name>` | accept a friend's new key, after comparing safety numbers (`i`) |
 | `/remove <name>` | group admin: take someone out of the open group |
 | `/grant <name>` / `/revoke <name>` | group admin: let a member remove people, or take that back |
-| `/leave` | leave the open group (the admin can't leave yet) |
+| `/handover <name>` | group admin: pass the admin role to a member, then you can leave |
+| `/claim` | take over a group that has no admin (made before admins existed) |
+| `/leave` | leave the open group (the admin hands over first) |
 | `/receipts on` / `off` | show or hide read receipts |
 | `/notify on` / `off` | desktop notifications for new messages (Linux, macOS, Windows) |
 | `/notify hide` / `show` | notifications say only "New message", or show who and what |
 | `/tutorial` / `/help` | the first-run tour again / every key |
 
 Whoever makes a group is its admin. Only the admin, or a member the admin has
-granted, can `/remove` people; anyone can `/leave`. Everyone in a group needs
-0.9.8 or newer for these to work.
+granted, can `/remove` people; anyone can `/leave`, except the admin, who
+hands the role over with `/handover` first. A group made before admins existed
+has none: the first member to `/claim` it becomes admin. Everyone in a group
+needs 0.9.8 or newer for these to work.
 
 ## Back up your account
 

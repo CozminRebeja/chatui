@@ -1084,6 +1084,8 @@ impl App {
                     ),
                     key("/remove <name>", "group admin: remove someone"),
                     key("/grant, /revoke", "group admin: let a member remove people"),
+                    key("/handover <name>", "group admin: pass the admin role on"),
+                    key("/claim", "take over a group with no admin"),
                     key("/leave", "leave the open group"),
                     key("/receipts on|off", "show or hide read receipts"),
                     key("/notify on|off", "desktop notifications"),
