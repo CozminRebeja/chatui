@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
 use e2e::{Fail, Olm, PREKEYS};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -29,6 +30,9 @@ struct Store {
     /// Set with `/receipts off`: don't tell senders we've read their messages.
     #[serde(default)]
     no_receipts: bool,
+    /// Set with `/notify off`: no desktop notifications for new messages.
+    #[serde(default)]
+    no_alerts: bool,
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
     /// Keys we compared in person (safety numbers) or got through an invite code.
@@ -190,6 +194,8 @@ struct App {
     msel: Option<String>, // selected message (by id) in the message pane
     reply_to: Option<Quote>,
     theme_err: String, // last theme load error, so it's shown once
+    /// Whether the terminal window has focus (from focus events).
+    focused: bool,
 }
 
 /// Longest message we send, so it stays well under the relay's size limit.
@@ -209,6 +215,23 @@ fn rand_id() -> String {
     let mut b = [0u8; 12];
     OsRng.fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The text of a desktop notification: who, where for groups, then the message (shortened).
+fn alert_text(from: &str, group: Option<&str>, text: &str) -> String {
+    let short: String = text.chars().take(100).collect();
+    match group {
+        Some(g) => format!("{from} in #{g}: {short}"),
+        None => format!("{from}: {short}"),
+    }
+}
+
+/// Shows a desktop notification through the system's notify-send, if there is one.
+/// The text goes in as an argument, never through a shell.
+fn notify_desktop(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=chatui", "chatui", body])
+        .spawn();
 }
 
 /// Strips control characters and invisible direction marks, which can make a name
@@ -278,7 +301,7 @@ struct MouseGuard;
 
 impl Drop for MouseGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     }
 }
 
@@ -343,6 +366,7 @@ pub fn run() -> Result<(), String> {
         msel: None,
         reply_to: None,
         theme_err: String::new(),
+        focused: true,
     };
     app.reload_theme();
     app.resume_tutorial();
@@ -350,7 +374,7 @@ pub fn run() -> Result<(), String> {
         app.connect();
     }
     let mut term = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange);
     // turns mouse capture off even if the app panics, otherwise the shell gets mouse movements as typed input
     let mouse = MouseGuard;
     let res = app.run_loop(&mut term, rx);
@@ -375,6 +399,8 @@ impl App {
                 match event::read().map_err(|e| e.to_string())? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
                     Event::Mouse(m) => self.on_mouse(m),
+                    Event::FocusGained => self.focused = true,
+                    Event::FocusLost => self.focused = false,
                     _ => {}
                 }
             }
@@ -1308,6 +1334,9 @@ impl App {
                 // or before 1970: times at chrono's limits crash local-time display
                 let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
                 let ts = m.ts.clamp(epoch, Utc::now());
+                let open_chat = self.sel == ci;
+                let alert = (!self.store.no_alerts && !(self.focused && open_chat))
+                    .then(|| alert_text(&from, c.group.then_some(c.name.as_str()), &text));
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -1332,6 +1361,9 @@ impl App {
                         .write_all(b"\x07")
                         .and_then(|_| io::stdout().flush());
                     self.notify(ping, false);
+                }
+                if let Some(body) = alert {
+                    notify_desktop(&body);
                 }
             }
             "read" => {
@@ -1477,6 +1509,7 @@ mod tests {
             msel: None,
             reply_to: None,
             theme_err: String::new(),
+            focused: true,
         };
         let (code, pin) = split_invite(invite);
         let login = handshake(server, me, &a.sk, &code).unwrap();
@@ -2226,6 +2259,18 @@ mod tests {
     }
 
     #[test]
+    fn alert_text_names_the_sender_and_group() {
+        assert_eq!(alert_text("bob", None, "hi"), "bob: hi");
+        assert_eq!(alert_text("bob", Some("trip"), "hi"), "bob in #trip: hi");
+        let long = "x".repeat(300);
+        assert_eq!(
+            alert_text("bob", None, &long).chars().count(),
+            "bob: ".len() + 100
+        );
+    }
+
+    /// The `/receipts` command switches read receipts off and on.
+    #[test]
     fn receipts_command_switches_them_off_and_on() {
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
         let (addr, state) = relay();
@@ -2242,6 +2287,27 @@ mod tests {
         type_line(&mut alice, "/receipts on");
         assert!(!alice.store.no_receipts);
         assert!(alice.input.text.is_empty());
+        fs::remove_file(&state).ok();
+    }
+
+    /// The `/notify` command switches alerts off and on.
+    #[test]
+    fn notify_command_switches_alerts() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.focus = Focus::Input;
+        let type_line = |a: &mut App, line: &str| {
+            for c in line.chars() {
+                a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        assert!(!alice.store.no_alerts, "alerts are on by default");
+        type_line(&mut alice, "/notify off");
+        assert!(alice.store.no_alerts);
+        type_line(&mut alice, "/notify on");
+        assert!(!alice.store.no_alerts);
         fs::remove_file(&state).ok();
     }
 }
