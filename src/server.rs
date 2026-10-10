@@ -28,6 +28,23 @@ impl Server {
             eprintln!("save failed: {e}");
         }
     }
+
+    /// Every relayed message, still encrypted, one JSON line each in messages.jsonl
+    /// next to the state file. The server has no keys, so it can't read them.
+    fn archive(&self, from: &str, to: &str, data: &[u8]) {
+        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        let line =
+            serde_json::json!({ "ts": chrono::Utc::now(), "from": from, "to": to, "data": hex });
+        let res = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(self.path.with_file_name("messages.jsonl"))
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if let Err(e) = res {
+            eprintln!("archive failed: {e}");
+        }
+    }
 }
 
 pub fn run(addr: &str, path: &Path) {
@@ -133,6 +150,7 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
                     let _ = err(&mut w, &format!("unknown user {}", p.to), &p.id);
                     continue;
                 }
+                s.archive(&user, &p.to, &p.data);
                 let out = Pkt {
                     t: "msg".into(),
                     from: user.clone(),

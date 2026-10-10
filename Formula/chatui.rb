@@ -8,6 +8,8 @@ class Chatui < Formula
   depends_on "rust" => :build
 
   def install
+    # prefilled on the first-run screen; anyone can change it there
+    ENV["CHATUI_SERVER"] = "minpi.local:7777"
     system "cargo", "install", *std_cargo_args
   end
 

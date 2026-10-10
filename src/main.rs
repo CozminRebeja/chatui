@@ -253,6 +253,10 @@ mod tests {
         .unwrap();
         let k = pkt(&mut ar);
         assert_eq!((k.keys.get("bob"), k.keys.len()), (Some(&bob), 1));
+        // everything relayed is archived, encrypted
+        let archive = fs::read_to_string(dir.join("messages.jsonl")).unwrap();
+        assert_eq!(archive.lines().count(), 2);
+        assert!(!archive.contains("hi") && !archive.contains("yo"));
         fs::remove_dir_all(dir).ok();
     }
 }
