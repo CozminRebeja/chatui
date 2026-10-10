@@ -1408,7 +1408,10 @@ impl App {
         };
         self.sel = ci;
         self.scroll = 0;
-        self.popup = None;
+        // a reply from a friend must not close the first-run tour
+        if !matches!(self.popup, Some(Popup::Tutorial(_))) {
+            self.popup = None;
+        }
         self.focus = Focus::Input;
         self.commit();
     }
@@ -2453,6 +2456,25 @@ mod tests {
         alice.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(alice.popup.is_none());
         assert!(alice.store.tutorial.is_none(), "closing it for good");
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn friend_reply_keeps_the_tour_open() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.start_tutorial();
+        let bob = SecretKey::generate(&mut OsRng).public_key().to_bytes();
+        alice.on_keys(Pkt {
+            users: vec!["bob".into()],
+            keys: BTreeMap::from([("bob".to_string(), bob)]),
+            ..Default::default()
+        });
+        assert!(alice.find("bob").is_some(), "the chat was opened");
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(0))),
+            "the tour stays open"
+        );
         fs::remove_file(&state).ok();
     }
 
