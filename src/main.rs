@@ -1017,6 +1017,37 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// Behind a proxy every connection comes from 127.0.0.1, so the relay goes by the
+    /// address in CF-Connecting-IP: one address can't hold every login slot.
+    #[test]
+    fn one_address_cant_take_every_login_slot() {
+        use tungstenite::client::IntoClientRequest;
+        let (addr, dir) = test_server("logins");
+        // opens a socket "from" an address, and says if the relay sent its challenge
+        let open = |from: &str| {
+            let tcp = TcpStream::connect(&addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = format!("ws://{addr}").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("cf-connecting-ip", from.parse().unwrap());
+            match tungstenite::client(req, tcp) {
+                Ok((mut ws, _)) => {
+                    let got = recv(&mut ws).is_some();
+                    (Some(ws), got)
+                }
+                Err(_) => (None, false),
+            }
+        };
+        // one address takes its 8 slots and never logs in
+        let held: Vec<_> = (0..8).map(|_| open("203.0.113.9")).collect();
+        assert!(held.iter().all(|(_, got)| *got));
+        // a 9th from it is dropped, while someone else still gets in
+        assert!(!open("203.0.113.9").1);
+        assert!(open("198.51.100.7").1);
+        drop(held);
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn usernames_are_restricted() {
         assert!(valid_name("alice_1-x"));
