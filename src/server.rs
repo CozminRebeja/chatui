@@ -2,7 +2,7 @@ use crate::*;
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
 use std::collections::{BTreeSet, HashMap};
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use tungstenite::WebSocket;
@@ -135,7 +135,14 @@ impl Write for Conn {
     }
 }
 
-pub fn run(addr: &str, path: &Path, admin: Option<&str>) -> Result<(), String> {
+/// The relay's UDP side for calls, and the address clients reach it at.
+struct Calls {
+    allocs: Mutex<reflector::Allocs>,
+    /// "host:port", or ":port" for the same host as the WebSocket; empty if off.
+    public: String,
+}
+
+pub fn run(addr: &str, path: &Path, admin: Option<&str>, udp: &str) -> Result<(), String> {
     let _lock = lock(path)?; // held for as long as the relay runs
     if let Some(a) = admin {
         edit(path, |s| set_admin(s, a))?;
@@ -145,7 +152,7 @@ pub fn run(addr: &str, path: &Path, admin: Option<&str>) -> Result<(), String> {
         "chatui relay listening on {addr}, state in {}",
         path.display()
     );
-    serve(l, path);
+    serve_with(l, path, udp);
     Ok(())
 }
 
@@ -240,7 +247,15 @@ pub fn release_cmd(path: &Path, user: &str) -> Result<String, String> {
     Ok(msg)
 }
 
+#[cfg(test)]
 pub fn serve(l: TcpListener, path: &Path) {
+    serve_with(l, path, "")
+}
+
+/// Serve on `l`, and calls on the same port over UDP. `udp` is where clients
+/// reach that UDP port, when it isn't the WebSocket's host (say, the WebSocket
+/// goes through a Cloudflare Tunnel, which can't carry UDP).
+pub fn serve_with(l: TcpListener, path: &Path, udp: &str) {
     let archive = path.with_file_name("messages.jsonl");
     if archive.exists() {
         eprintln!(
@@ -277,6 +292,32 @@ pub fn serve(l: TcpListener, path: &Path) {
             }
         }
     });
+    let sock = match l.local_addr().and_then(UdpSocket::bind) {
+        Ok(sock) => Some(sock),
+        Err(e) => {
+            eprintln!("calls can't go through this relay (UDP: {e})");
+            None
+        }
+    };
+    let public = match (&sock, udp) {
+        (None, _) => String::new(),
+        (Some(s), "") => format!(":{}", s.local_addr().map_or(0, |a| a.port())),
+        (Some(_), u) => u.into(),
+    };
+    if sock.is_some() {
+        eprintln!("calls: UDP on the same port, clients reach it at {public}");
+    }
+    let calls: &'static Calls = Box::leak(Box::new(Calls {
+        allocs: Default::default(),
+        public,
+    }));
+    if let Some(sock) = sock {
+        std::thread::spawn(move || reflector::run(sock, &calls.allocs));
+    }
+    accept(l, srv, calls)
+}
+
+fn accept(l: TcpListener, srv: &'static Mutex<Server>, calls: &'static Calls) {
     let sk: &'static SecretKey = Box::leak(Box::new(SecretKey::generate(&mut OsRng)));
     static CONN_ID: AtomicU64 = AtomicU64::new(0);
     static CONNS: AtomicUsize = AtomicUsize::new(0);
@@ -292,7 +333,7 @@ pub fn serve(l: TcpListener, path: &Path) {
         let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
             let _conn = conn;
-            handle(c, id, srv, sk, login)
+            handle(c, id, srv, sk, calls, login)
         });
     }
 }
@@ -312,7 +353,14 @@ fn err_pkt(e: &str, id: &str) -> Pkt {
     }
 }
 
-fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: Slot) -> Option<()> {
+fn handle(
+    c: TcpStream,
+    conn: u64,
+    srv: &Mutex<Server>,
+    sk: &SecretKey,
+    calls: &Calls,
+    login: Slot,
+) -> Option<()> {
     c.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let ctl = c.try_clone().ok()?;
     let c = Conn {
@@ -561,6 +609,26 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
                     ..Default::default()
                 });
             }
+            // a place on our UDP side for a call: a secret token to send with,
+            // and the public id others send to
+            "udp" if !calls.public.is_empty() => {
+                let a = calls
+                    .allocs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&user);
+                let Some((token, peer)) = a else {
+                    let _ = tx.send(err_pkt("too many calls on this relay right now", &p.id));
+                    return;
+                };
+                let _ = tx.send(Pkt {
+                    t: "udp".into(),
+                    data: token.to_vec(),
+                    id: hex(&peer),
+                    udp: calls.public.clone(),
+                    ..Default::default()
+                });
+            }
             // admin only; an empty `user` just lists who's removed
             "ban" | "unban" => {
                 if s.state.admin != user {
@@ -583,6 +651,11 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
                         s.state.queue.remove(&who);
                         s.state.prekeys.remove(&who);
                         s.online.remove(&who); // their connection closes
+                        calls
+                            .allocs
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove_user(&who);
                     } else {
                         s.state.banned.remove(&who);
                     }

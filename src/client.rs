@@ -1,9 +1,12 @@
+mod call;
 mod e2e;
+mod media;
 mod ui;
 
 use crate::theme;
 use crate::vault::Vault;
 use crate::*;
+use call::{Call, Ring, Sig};
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
 use e2e::{Fail, Olm, PREKEYS};
@@ -32,6 +35,8 @@ struct Store {
     verified: BTreeMap<String, Key>,
     /// Key pins from an invite code, waiting for that person's key to arrive.
     expect: BTreeMap<String, String>,
+    /// Calls always go through the relay, so nobody we call learns our IP.
+    relay_only: bool,
 }
 
 impl Store {
@@ -131,11 +136,15 @@ struct Payload {
     name: String,
     members: BTreeMap<String, Key>,
     reply: Option<Quote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call: Option<Sig>,
 }
 
 enum Ev {
     Pkt(Pkt),
     Down(u64),
+    /// From the voice engine of the call with this id.
+    Media(String, media::Event),
 }
 
 /// First run: no identity yet, ask for a username, server and invite code.
@@ -183,6 +192,10 @@ struct App {
     msel: Option<String>, // selected message (by id) in the message pane
     reply_to: Option<Quote>,
     theme_err: String, // last theme load error, so it's shown once
+    call: Option<Call>,
+    ring: Option<Ring>,
+    /// Group chat id → a call someone started there, that we could join.
+    ongoing: BTreeMap<String, String>,
 }
 
 /// Longest message we send, so it stays well under the relay's size limit.
@@ -336,6 +349,9 @@ pub fn run() -> Result<(), String> {
         msel: None,
         reply_to: None,
         theme_err: String::new(),
+        call: None,
+        ring: None,
+        ongoing: BTreeMap::new(),
     };
     app.reload_theme();
     if app.setup.is_none() {
@@ -371,15 +387,9 @@ impl App {
                 }
             }
             while let Ok(ev) = rx.try_recv() {
-                match ev {
-                    Ev::Pkt(p) => self.on_pkt(p),
-                    Ev::Down(g) if g == self.generation => {
-                        self.conn = None;
-                        self.notify("disconnected, retrying…", true);
-                    }
-                    Ev::Down(_) => {}
-                }
+                self.on_ev(ev);
             }
+            self.call_tick();
             if self.setup.is_none()
                 && self.conn.is_none()
                 && last_try.elapsed() > Duration::from_secs(3)
@@ -397,6 +407,18 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn on_ev(&mut self, ev: Ev) {
+        match ev {
+            Ev::Pkt(p) => self.on_pkt(p),
+            Ev::Down(g) if g == self.generation => {
+                self.conn = None;
+                self.notify("disconnected, retrying…", true);
+            }
+            Ev::Down(_) => {}
+            Ev::Media(id, e) => self.on_media(&id, e),
+        }
     }
 
     fn reload_theme(&mut self) {
@@ -1018,6 +1040,7 @@ impl App {
             "claim" => self.on_claim(p),
             "prekeys" if p.count < PREKEYS / 2 => self.publish_prekeys(p.count),
             "msg" => self.on_msg(p),
+            "udp" => self.on_udp(p),
             _ => {}
         }
     }
@@ -1237,6 +1260,24 @@ impl App {
             m.chat.clone()
         };
         match m.t.as_str() {
+            "call" => {
+                let Some(s) = m.call else { return };
+                match self.find(&chat_id) {
+                    Some(ci) => {
+                        let c = &self.store.chats[ci];
+                        if c.pending || !c.members.contains(&from) {
+                            return;
+                        }
+                    }
+                    // someone new calling: they get a chat, as with a message
+                    None if m.chat.is_empty() && s.kind == "ring" => {
+                        let c = Chat::new(from.clone(), from.clone(), vec![from.clone()], false);
+                        self.add_chat(c);
+                    }
+                    None => return,
+                }
+                return self.on_call(from, chat_id, s, m.ts);
+            }
             "msg" => {
                 let ci = match self.find(&chat_id) {
                     Some(i) => i,
@@ -1438,6 +1479,9 @@ mod tests {
             msel: None,
             reply_to: None,
             theme_err: String::new(),
+            call: None,
+            ring: None,
+            ongoing: BTreeMap::new(),
         };
         let (code, pin) = split_invite(invite);
         let login = handshake(server, me, &a.sk, &code).unwrap();
@@ -1487,8 +1531,8 @@ mod tests {
         let end = Instant::now() + Duration::from_secs(5);
         while !done(a) {
             assert!(Instant::now() < end, "{} timed out", a.me);
-            if let Ok(Ev::Pkt(p)) = rx.recv_timeout(Duration::from_millis(20)) {
-                a.on_pkt(p);
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(20)) {
+                a.on_ev(ev);
             }
         }
     }
@@ -2076,6 +2120,199 @@ mod tests {
             err && msg.starts_with("could not save chat history"),
             "{msg}"
         );
+        fs::remove_file(&state).ok();
+    }
+
+    /// Feed every app its packets until `done` holds for all of them.
+    fn all(apps: &mut [(&mut App, &Receiver<Ev>)], done: impl Fn(&App) -> bool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !apps.iter().all(|(a, _)| done(a)) {
+            if Instant::now() > end {
+                for (a, _) in apps.iter() {
+                    let c = a.call.as_ref();
+                    eprintln!(
+                        "{}: roster {:?} epoch {:?} emoji {:?} status {:?} joining {:?} toast {:?}",
+                        a.me,
+                        c.map(|c| &c.keying.roster),
+                        c.map(|c| c.keying.epoch),
+                        c.and_then(|c| c.emoji),
+                        c.map(|c| &c.status),
+                        c.map(|c| c.joining),
+                        a.toast
+                    );
+                }
+                panic!("timed out");
+            }
+            for (a, rx) in apps.iter_mut() {
+                while let Ok(ev) = rx.recv_timeout(Duration::from_millis(5)) {
+                    a.on_ev(ev);
+                }
+                a.call_tick();
+            }
+        }
+    }
+
+    /// What `a` shows, as text, row by row.
+    fn screen(a: &mut App) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 34)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out += buf[(x, y)].symbol();
+            }
+            out += "\n";
+        }
+        out
+    }
+
+    fn emoji(a: &App) -> Option<[&'static str; 4]> {
+        a.call.as_ref()?.emoji
+    }
+
+    /// Everyone's voice reaches everyone: straight across, or through the relay.
+    fn connected(a: &App) -> bool {
+        a.call.as_ref().is_some_and(|c| {
+            c.keying.others().iter().all(|u| {
+                c.status
+                    .get(u)
+                    .is_some_and(|s| s.0 != media::Path::Connecting)
+            })
+        })
+    }
+
+    /// alice calls bob: it rings, he answers, both see the same four emoji, the
+    /// voice gets through, and hanging up ends it for both.
+    #[test]
+    fn one_to_one_call() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        bob.new_dm("alice").unwrap();
+        until(&mut bob, &rb, |a| a.find("alice").is_some());
+        alice.new_dm("bob").unwrap();
+        until(&mut alice, &ra, |a| a.find("bob").is_some());
+
+        alice.sel = alice.find("bob").unwrap();
+        alice.focus = Focus::Chats;
+        press(&mut alice, KeyCode::Char('c'));
+        assert!(matches!(alice.popup, Some(Popup::Call)));
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| a.ring.is_some());
+        assert!(matches!(bob.popup, Some(Popup::Ring { .. })));
+        // a key typed just as it pops up doesn't answer
+        press(&mut bob, KeyCode::Char('y'));
+        assert!(bob.call.is_none() && bob.ring.is_some());
+        bob.answer();
+        all(&mut [(&mut alice, &ra), (&mut bob, &rb)], |a| {
+            emoji(a).is_some() && connected(a)
+        });
+        assert_eq!(emoji(&alice), emoji(&bob));
+        // the emoji are on screen, in the call window and the bar above the chat
+        let shown = screen(&mut alice);
+        let four = emoji(&alice).unwrap();
+        assert_eq!(shown.matches(four[0]).count(), 2, "{shown}");
+        assert!(shown.contains("Ask bob to read out theirs."), "{shown}");
+
+        press(&mut bob, KeyCode::Char('x'));
+        assert!(bob.call.is_none());
+        settle(&mut bob, &rb);
+        until(&mut alice, &ra, |a| a.call.is_none());
+        for a in [&alice, &bob] {
+            let last = &a.store.chats[a.sel].msgs.last().unwrap().text;
+            assert!(last.starts_with("📞 call · 0:0"), "{}: {last}", a.me);
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// alice starts a call in a group; bob and carol join it, and all three
+    /// end up with the same emoji.
+    #[test]
+    fn group_call() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("band", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+
+        alice.sel = alice.find(&gid).unwrap();
+        alice.call_key();
+        settle(&mut alice, &ra);
+        for (a, rx) in [(&mut bob, &rb), (&mut carol, &rc)] {
+            until(a, rx, |a| a.ongoing.contains_key(&gid));
+            a.sel = a.find(&gid).unwrap();
+            a.call_key(); // joins the call going on
+            settle(a, rx);
+        }
+        all(
+            &mut [(&mut alice, &ra), (&mut bob, &rb), (&mut carol, &rc)],
+            |a| {
+                a.call
+                    .as_ref()
+                    .is_some_and(|c| c.keying.roster.len() == 3 && c.keying.epoch == 2)
+                    && emoji(a).is_some()
+                    && connected(a)
+            },
+        );
+        assert!(emoji(&alice) == emoji(&bob) && emoji(&bob) == emoji(&carol));
+
+        // carol leaves; the others carry on
+        carol.hang_up("", false);
+        settle(&mut carol, &rc);
+        all(&mut [(&mut alice, &ra), (&mut bob, &rb)], |a| {
+            a.call.as_ref().is_some_and(|c| c.keying.roster.len() == 2)
+        });
+        for a in [&alice, &bob, &carol] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+    }
+
+    /// A call key nobody committed to (as someone in the middle would have to
+    /// send) hangs the call up with a warning.
+    #[test]
+    fn uncommitted_call_key_hangs_up() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        bob.new_dm("alice").unwrap();
+        until(&mut bob, &rb, |a| a.find("alice").is_some());
+        alice.new_dm("bob").unwrap();
+        until(&mut alice, &ra, |a| a.find("bob").is_some());
+        alice.sel = alice.find("bob").unwrap();
+        alice.call_key();
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| a.ring.is_some());
+        let id = bob.ring.as_ref().unwrap().id.clone();
+        let reveal = Payload {
+            t: "call".into(),
+            call: Some(Sig {
+                kind: "reveal".into(),
+                id,
+                key: Some([9; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        forge(&mut bob, &rb, &alice, reveal);
+        until(&mut alice, &ra, |a| a.call.is_none());
+        assert!(alice.toast.as_ref().unwrap().0.contains("doesn't match"));
+        for a in [&alice, &bob] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
         fs::remove_file(&state).ok();
     }
 

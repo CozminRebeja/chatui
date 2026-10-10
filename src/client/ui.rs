@@ -62,6 +62,13 @@ pub enum Popup {
         names: Vec<String>,
         cursor: usize,
     },
+    /// The call we're in: emoji to compare, who's there, how they're connected.
+    Call,
+    /// Someone's calling. Keys do nothing for a moment, so a reply being typed
+    /// when it pops up doesn't answer it.
+    Ring {
+        since: std::time::Instant,
+    },
 }
 
 #[derive(Default)]
@@ -373,8 +380,10 @@ impl App {
         if self.setup.is_some() {
             return self.draw_setup(f);
         }
-        let [header, body, footer] = Layout::vertical([
+        let bar = u16::from(self.call.is_some() || self.ring.is_some());
+        let [header, callbar, body, footer] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(bar),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -390,6 +399,7 @@ impl App {
             input,
         };
         self.draw_header(f, header);
+        self.draw_callbar(f, callbar);
         self.draw_chats(f, side);
         self.draw_messages(f, msgs);
         self.draw_input(f, input);
@@ -555,6 +565,52 @@ impl App {
         );
     }
 
+    fn chat_label(&self, chat: &str) -> String {
+        match self.find(chat).map(|i| &self.store.chats[i]) {
+            Some(c) if c.group => format!("#{}", c.name),
+            Some(c) => c.name.clone(),
+            None => chat.into(),
+        }
+    }
+
+    /// One line under the header while a call is ringing or going on.
+    fn draw_callbar(&self, f: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let key = |k: &'static str, d: &'static str| {
+            vec![k.fg(th().accent).bold(), format!(" {d}  ").fg(th().dim)]
+        };
+        let mut l: Vec<Span> = vec![" 📞 ".into()];
+        if let Some(r) = &self.ring {
+            l.push(format!("{} is calling  ", r.from).bold().fg(th().bright));
+            l.extend(key("c", "answer"));
+            l.extend(key("x", "decline"));
+        } else if let Some(c) = &self.call {
+            l.push(self.chat_label(&c.chat).bold());
+            l.push("  ".into());
+            match (c.answered, c.emoji) {
+                (Some(t), Some(e)) => {
+                    l.push(call::duration(t.elapsed()).fg(th().muted));
+                    l.push("  ".into());
+                    l.push(e.join(" ").into());
+                    l.push("  ".into());
+                }
+                _ if c.joining.is_some() => l.push("joining…  ".fg(th().warn)),
+                _ if c.keying.roster.len() > 1 => l.push("exchanging keys…  ".fg(th().warn)),
+                _ if c.group => l.push("waiting for others…  ".fg(th().warn)),
+                _ => l.push("ringing…  ".fg(th().warn)),
+            }
+            if c.muted {
+                l.push("muted  ".fg(th().error).bold());
+            }
+            l.extend(key("c", "details"));
+            l.extend(key("m", if c.muted { "unmute" } else { "mute" }));
+            l.extend(key("x", "hang up"));
+        }
+        f.render_widget(Line::from(l).bg(th().selected_bg), area);
+    }
+
     fn draw_chats(&mut self, f: &mut Frame, area: Rect) {
         let block = pane(
             " Friends & groups ",
@@ -587,7 +643,11 @@ impl App {
                 } else {
                     Style::new()
                 };
+                let in_call = self.call.as_ref().is_some_and(|k| k.chat == c.id)
+                    || self.ongoing.contains_key(&c.id)
+                    || self.ring.as_ref().is_some_and(|r| r.chat == c.id);
                 let icon = match (c.group, c.pending) {
+                    _ if in_call => "📞",
                     (_, true) => "? ",
                     (true, _) => "# ",
                     _ => "@ ",
@@ -963,6 +1023,7 @@ impl App {
                 ("f", "add friend"),
                 ("g", "new group"),
                 ("+", "add to group"),
+                ("c", "call"),
                 ("v", "invite"),
                 ("i", "info"),
                 ("d", "remove"),
@@ -1020,6 +1081,12 @@ impl App {
                     key("d", "remove friend / group from this device"),
                     key("a", "account & server"),
                     key("B", "relay admins: remove people"),
+                    Line::default(),
+                    head("Calls"),
+                    key("c", "call the open chat / join its call / call details"),
+                    key("m  /  x", "mute / hang up (c answers, x declines)"),
+                    Line::from("  In a call, compare the four emoji with everyone:").fg(th().dim),
+                    Line::from("  if they match, nobody else can listen in.").fg(th().dim),
                     Line::default(),
                     head("Themes"),
                     key("t  or  Ctrl-T", "pick a theme (Ctrl-T works while typing)"),
@@ -1463,6 +1530,115 @@ impl App {
                 );
                 f.render_widget(Line::from(err.as_str()).fg(th().error), rows[5]);
             }
+            Some(Popup::Call) => {
+                let Some(c) = &self.call else { return };
+                let dim = |t: String| Line::from(t).fg(th().dim);
+                let mut text = vec![
+                    Line::from(vec!["📞 ".into(), self.chat_label(&c.chat).bold()]),
+                    dim(format!(
+                        "{}{} in the call · end-to-end encrypted",
+                        c.answered
+                            .map(|t| format!("{} · ", call::duration(t.elapsed())))
+                            .unwrap_or_default(),
+                        c.keying.roster.len()
+                    )),
+                    Line::default(),
+                ];
+                match c.emoji {
+                    Some(e) => {
+                        text.push(Line::from("Security code").bold());
+                        text.push(Line::from(format!("   {}", e.join("   "))));
+                        let who = if c.group {
+                            "Everyone in the call should see these same four.".to_string()
+                        } else {
+                            format!("Ask {} to read out theirs.", c.chat)
+                        };
+                        text.push(dim(who));
+                        text.push(dim("If they match, nobody else can listen in.".into()));
+                    }
+                    None if c.keying.roster.len() > 1 => {
+                        text.push(Line::from("exchanging keys…").fg(th().warn))
+                    }
+                    None => text.push(Line::from("waiting for an answer…").fg(th().warn)),
+                }
+                text.push(Line::default());
+                for u in c.keying.others() {
+                    let (path, talking) = c
+                        .status
+                        .get(&u)
+                        .copied()
+                        .unwrap_or((media::Path::Connecting, false));
+                    let path = match path {
+                        media::Path::Direct => "● direct".fg(th().ok),
+                        media::Path::Relay => "● via relay".fg(th().ok),
+                        media::Path::Connecting => "◌ connecting…".fg(th().warn),
+                    };
+                    let mut l = vec![format!("  {u:<20}").fg(name_color(&u)), path];
+                    if talking {
+                        l.push("  talking".fg(th().accent));
+                    }
+                    text.push(Line::from(l));
+                }
+                text.push(Line::from(vec![
+                    format!("  {:<20}", "you").into(),
+                    if c.muted {
+                        "muted".fg(th().error).bold()
+                    } else {
+                        "mic on".fg(th().muted)
+                    },
+                ]));
+                text.push(Line::default());
+                text.push(dim(if self.store.relay_only {
+                    "Voice always goes through the relay; nobody sees your IP.".into()
+                } else {
+                    "Voice goes straight to each person when it can.".into()
+                }));
+                let area = centered(screen, 64, text.len() as u16 + 4);
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Paragraph::new(text).block(
+                        popup_block(
+                            "Call",
+                            &[
+                                ("m", if c.muted { "unmute" } else { "mute" }),
+                                ("x", "hang up"),
+                                ("r", "relay only"),
+                                ("Esc", "close"),
+                            ],
+                        )
+                        .padding(ratatui::widgets::Padding::uniform(1)),
+                    ),
+                    area,
+                );
+            }
+            Some(Popup::Ring { .. }) => {
+                let Some(r) = &self.ring else { return };
+                let trust = if self.verified(&r.from) {
+                    "✓ verified".fg(th().ok)
+                } else {
+                    "not verified: compare the emoji once you answer".fg(th().warn)
+                };
+                let text = vec![
+                    Line::from(vec![
+                        "📞 ".into(),
+                        r.from.clone().bold(),
+                        " is calling".into(),
+                    ]),
+                    Line::from(trust),
+                ];
+                let area = centered(screen, 60, 6);
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Paragraph::new(text).block(
+                        popup_block(
+                            "Incoming call",
+                            &[("y", "answer"), ("n", "decline"), ("Esc", "hide")],
+                        )
+                        .padding(ratatui::widgets::Padding::horizontal(1)),
+                    ),
+                    area,
+                );
+            }
             Some(Popup::Themes { names, cursor }) => {
                 let list_h = names.len().min(12) as u16;
                 let area = centered(screen, 52, list_h + 7);
@@ -1651,6 +1827,10 @@ impl App {
                     server: Field::from(self.server.as_str()),
                 })
             }
+            KeyCode::Char('c') => self.call_key(),
+            KeyCode::Char('m') if self.call.is_some() => self.toggle_mute(),
+            KeyCode::Char('x') if self.ring.is_some() => self.decline(),
+            KeyCode::Char('x') if self.call.is_some() => self.hang_up("", false),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -1966,6 +2146,36 @@ impl App {
                     false
                 }
                 KeyCode::Esc | KeyCode::Char('q' | 'v') => false,
+                _ => true,
+            },
+            Popup::Call => match k.code {
+                KeyCode::Char('m') => {
+                    self.toggle_mute();
+                    true
+                }
+                KeyCode::Char('x') => {
+                    self.hang_up("", false);
+                    false
+                }
+                KeyCode::Char('r') => {
+                    self.toggle_relay_only();
+                    true
+                }
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c' | 'q') => false,
+                _ => true,
+            },
+            Popup::Ring { since } if since.elapsed() < Duration::from_millis(800) => true,
+            Popup::Ring { .. } => match k.code {
+                KeyCode::Char('y') => {
+                    self.answer();
+                    false
+                }
+                KeyCode::Char('n') => {
+                    self.decline();
+                    false
+                }
+                // hidden, still ringing: c answers, x declines
+                KeyCode::Esc => false,
                 _ => true,
             },
             Popup::Themes { names, cursor } => {

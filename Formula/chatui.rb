@@ -5,7 +5,13 @@ class Chatui < Formula
   sha256 "0dc4ca9fc267e9ff294a934535fdb57923b68865bf9db70fb9a39131a5695407"
   head "https://github.com/CozminRebeja/chatui.git", branch: "main"
 
+  depends_on "cmake" => :build # libopus, for calls
   depends_on "rust" => :build
+
+  on_linux do
+    depends_on "pkgconf" => :build
+    depends_on "alsa-lib" # microphone and speakers
+  end
 
   def install
     # prefilled on the first-run screen; anyone can change it there

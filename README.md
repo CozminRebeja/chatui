@@ -55,6 +55,7 @@ messages. If someone adds you to a group, you join it with `y` or decline with `
 | Key | |
 | --- | --- |
 | `f` | add a friend by username |
+| `c` | call the open chat, or join the call going on in a group (`m` mutes, `x` hangs up) |
 | `v` | invite someone new (`c` copies a message to send them) |
 | `g` / `+` / `e` | new group / add people to the open group / rename it |
 | `@name` | mention someone (Tab completes) |
@@ -62,6 +63,22 @@ messages. If someone adds you to a group, you join it with `y` or decline with `
 | `i` | safety number to compare in person (`m` marks it verified), group members |
 | `t` or Ctrl-T | pick a theme: default, dracula, gruvbox, nord, solarized, synthwave, or your own |
 | `?` | everything else |
+
+## Calls
+
+Press `c` in a chat to call. It works for one-to-one chats and for groups of up to
+8 people. In a group, everyone gets a note that a call has started, and joins with
+`c`. Once you're connected, everyone sees the same **four emoji**. Read them out to
+each other: if they match, nobody else can listen in. Like Telegram's, they come
+from a key made fresh for every call, which a listener in the middle can't fake
+without the emoji coming out different.
+
+Voice is sent with Opus over UDP, encrypted end to end. It goes straight to the
+other person when both of your networks allow it, and through the relay when they
+don't. Going straight means the other person learns your IP address. To avoid
+that, press `r` in the call window: voice then always goes through the relay. On
+macOS your terminal asks for the microphone the first time; on Linux you need
+ALSA (or PipeWire/PulseAudio with ALSA support), which the .deb installs.
 
 ## Themes, made by AI
 
@@ -102,6 +119,15 @@ invites stop working. A relay from before 0.9 has no admin yet: run
 Someone forgot their passphrase? With the relay stopped, `chatui serve --release <name>`
 frees their username and `chatui serve --invite` prints a code to sign up with again.
 
+**Calls** use UDP on the same port as the relay (6769 by default), for people
+whose networks won't let them reach each other directly. A Cloudflare Tunnel
+can't carry UDP, so open that port on the relay's machine and tell the relay
+where clients can reach it: `chatui serve --udp calls.example.com:6769`, a name
+that points straight at the machine, not through the tunnel. Without that, calls
+still work whenever both people can reach each other directly. The relay only
+passes along encrypted voice, caps each person at about 96 KB/s, and never sends
+anything to an address that didn't first prove it belongs to a logged-in person.
+
 The relay speaks plain WebSocket, and clients only connect to it over TLS (wss),
 so put it behind something that terminates TLS with a real certificate, such as
 a Cloudflare Tunnel. `chat.example.com` connects on 443, `chat.example.com:8443`
@@ -120,12 +146,18 @@ can't see who talks to whom or hand out fake keys.
   quietly.
 - **Encrypted on disk** with your passphrase (Argon2id, XSalsa20-Poly1305), and
   any tampering with the files is caught.
+- **Calls** are end-to-end encrypted too. Call setup goes through the same Olm
+  sessions as messages. Each call agrees fresh X25519 keys by commit-then-reveal,
+  and everyone compares 4 emoji made from them. Every voice packet is sealed with
+  ChaCha20-Poly1305 under a key only its sender and receiver have, and replays
+  are dropped.
 - **The relay** never holds keys that can read messages. It keeps undelivered
   messages, encrypted, until they're picked up, and keeps nothing after that.
   It only takes TLS from anywhere but `localhost`.
 
 What it doesn't hide: the relay sees who messages whom and when, and how big the
-messages are. Each account lives on one device. chatui's own code hasn't been
+messages are; for calls, who calls whom and for how long. A direct call shows
+each person's IP address to the others (`r` in a call turns that off). Each account lives on one device. chatui's own code hasn't been
 independently audited; the cryptography comes from libraries that have.
 Upgrading from before 0.9: everyone in a chat needs the new version; older
 clients are told to update rather than silently dropped.
