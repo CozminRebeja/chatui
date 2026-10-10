@@ -302,41 +302,110 @@ impl App {
         }
     }
 
+    /// First-run login: username + server, with instructions for finding both.
     fn draw_setup(&self, f: &mut Frame) {
         let Some(s) = &self.setup else { return };
-        let area = centered(f.area(), 64, 16);
+        let area = centered(f.area(), 74, 25);
         f.render_widget(Clear, area);
         let block = popup_block(
-            "chatui",
-            &[("⏎", "continue"), ("Tab", "switch field"), ("Esc", "quit")],
+            "Welcome to chatui",
+            &[("⏎", "log in"), ("Tab", "next field"), ("Esc", "quit")],
         );
-        let inner = block.inner(area).inner(Margin::new(2, 1));
+        let inner = block.inner(area).inner(Margin::new(3, 1));
         f.render_widget(block, area);
-        let rows = Layout::vertical([
+        let [
+            intro,
+            _,
+            u_label,
+            u_field,
+            u_help,
+            _,
+            s_label,
+            s_field,
+            s_help,
+            _,
+            note,
+            status,
+        ] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(5),
             Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(1),
         ])
-        .split(inner);
-        f.render_widget(
-            Line::from("end-to-end encrypted chat for you and your friends").bold(),
-            rows[0],
-        );
-        let intro = "Pick a username and enter the relay server your friends use. \
-                     Your keys are generated on this machine and never leave it.";
-        f.render_widget(
-            Paragraph::new(intro)
+        .areas(inner);
+        let help = |text: Vec<Line<'static>>| {
+            Paragraph::new(text)
                 .fg(Color::Gray)
-                .wrap(Wrap { trim: true }),
-            rows[2],
+                .wrap(Wrap { trim: true })
+        };
+        let label = |name: &'static str, on: bool| {
+            Line::from(name).style(if on {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new().bold()
+            })
+        };
+        let field = |f: &mut Frame, area: Rect, field: &Field, on: bool, placeholder: &str| {
+            f.render_widget(Block::new().style(Style::new().bg(FIELD_BG)), area);
+            field.render(f, area.inner(Margin::new(1, 0)), on, placeholder);
+        };
+        let code = |s: &'static str| Span::styled(s, Style::new().fg(ACCENT));
+
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from("Set up once. After this, just run chatui and talk to your friends.")
+                    .bold(),
+                Line::from("Messages are end-to-end encrypted.").fg(DIM),
+            ]),
+            intro,
         );
-        input_row(f, rows[4], "Username", &s.user, s.focus == 0, "e.g. alice");
-        input_row(f, rows[6], "Server", &s.server, s.focus == 1, "host:7777");
+
+        f.render_widget(label("Username", s.focus == 0), u_label);
+        field(f, u_field, &s.user, s.focus == 0, "e.g. alice");
+        f.render_widget(
+            help(vec![Line::from(
+                "The name your friends type to add you. Pick anything: 1-20 characters, \
+                 letters, numbers, _ or -. Names are first come, first served.",
+            )]),
+            u_help,
+        );
+
+        f.render_widget(label("Server", s.focus == 1), s_label);
+        field(f, s_field, &s.server, s.focus == 1, "host:7777");
+        f.render_widget(
+            help(vec![
+                Line::from("The chatui server your group shares, written as host:port."),
+                match option_env!("CHATUI_SERVER") {
+                    Some(d) => Line::from(vec![
+                        "• Your group's server is filled in: ".into(),
+                        code(d),
+                        ". Only change it if a friend gave you another one.".into(),
+                    ]),
+                    None => Line::from("• Ask the friend who runs it for the address."),
+                },
+                Line::from(vec![
+                    "• Hosting it yourself? On an always-on machine run ".into(),
+                    code("brew services start chatui"),
+                    " and use that machine's name with :7777.".into(),
+                ]),
+            ]),
+            s_help,
+        );
+
+        f.render_widget(
+            Paragraph::new("🔒 Your keys are created on this device and never leave it. The server only passes along encrypted messages.")
+                .fg(DIM)
+                .wrap(Wrap { trim: true }),
+            note,
+        );
         let err = Paragraph::new(s.err.as_str()).wrap(Wrap { trim: true });
         f.render_widget(
             if s.busy {
@@ -344,7 +413,7 @@ impl App {
             } else {
                 err.fg(Color::LightRed)
             },
-            rows[7],
+            status,
         );
     }
 
@@ -372,15 +441,15 @@ impl App {
 
     fn draw_chats(&mut self, f: &mut Frame, area: Rect) {
         let block = pane(
-            " Chats ",
+            " Friends & groups ",
             self.focus == Focus::Chats && self.popup.is_none(),
         );
         if self.store.chats.is_empty() {
             let text = vec![
                 Line::default(),
-                Line::from("No chats yet").fg(DIM).centered(),
+                Line::from("No friends yet").fg(DIM).centered(),
                 Line::default(),
-                Line::from(vec!["n".fg(ACCENT).bold(), "  new chat".fg(DIM)]).centered(),
+                Line::from(vec!["f".fg(ACCENT).bold(), "  add a friend".fg(DIM)]).centered(),
                 Line::from(vec!["g".fg(ACCENT).bold(), "  new group".fg(DIM)]).centered(),
             ];
             return f.render_widget(Paragraph::new(text).block(block), area);
@@ -507,10 +576,10 @@ impl App {
                     .centered(),
                 Line::from(vec![
                     "Press ".fg(DIM),
-                    "n".fg(ACCENT).bold(),
-                    " to message someone or ".fg(DIM),
+                    "f".fg(ACCENT).bold(),
+                    " to add a friend by username, ".fg(DIM),
                     "g".fg(ACCENT).bold(),
-                    " to start a group.".fg(DIM),
+                    " for a group.".fg(DIM),
                 ])
                 .centered(),
             ];
@@ -589,10 +658,10 @@ impl App {
             Focus::Chats => &[
                 ("↑↓", "select"),
                 ("⏎", "open"),
-                ("n", "new chat"),
+                ("f", "add friend"),
                 ("g", "new group"),
                 ("i", "info"),
-                ("d", "delete"),
+                ("d", "remove"),
                 ("a", "account"),
                 ("q", "quit"),
             ],
@@ -632,11 +701,11 @@ impl App {
                     key("PgUp / PgDn", "scroll messages"),
                     key("Mouse", "click to focus, wheel to scroll"),
                     Line::default(),
-                    head("Chats"),
-                    key("n", "new chat"),
+                    head("Friends & groups"),
+                    key("f", "add a friend (their username)"),
                     key("g", "new group (3+ people)"),
                     key("i", "members & key fingerprints"),
-                    key("d", "delete chat from this device"),
+                    key("d", "remove friend / group from this device"),
                     key("a", "account & server"),
                     Line::default(),
                     head("Message status"),
@@ -724,16 +793,34 @@ impl App {
                 let Some(c) = self.store.chats.get(self.sel) else {
                     return;
                 };
-                let text = vec![
-                    Line::from(vec!["Delete ".into(), c.name.clone().bold(), "?".into()]),
-                    Line::default(),
-                    Line::from("Its history is removed from this device only.").fg(DIM),
-                ];
-                let area = centered(screen, 52, 7);
+                let text = if c.group {
+                    vec![
+                        Line::from(vec![
+                            "Remove group ".into(),
+                            c.name.clone().bold(),
+                            "?".into(),
+                        ]),
+                        Line::default(),
+                        Line::from("Its history is deleted from this device and").fg(DIM),
+                        Line::from("you stop receiving its messages.").fg(DIM),
+                    ]
+                } else {
+                    vec![
+                        Line::from(vec![
+                            "Remove ".into(),
+                            c.name.clone().bold(),
+                            " from your friends?".into(),
+                        ]),
+                        Line::default(),
+                        Line::from("Your chat history with them is deleted from").fg(DIM),
+                        Line::from("this device. If they write again, they reappear.").fg(DIM),
+                    ]
+                };
+                let area = centered(screen, 56, 8);
                 f.render_widget(Clear, area);
                 f.render_widget(
                     Paragraph::new(text).block(
-                        popup_block("Delete chat", &[("y", "delete"), ("n", "cancel")])
+                        popup_block("Remove", &[("y", "remove"), ("n", "cancel")])
                             .padding(ratatui::widgets::Padding::horizontal(1)),
                     ),
                     area,
@@ -779,7 +866,7 @@ impl App {
             Some(Popup::NewChat { user, err }) => {
                 let area = centered(screen, 56, 9);
                 f.render_widget(Clear, area);
-                let block = popup_block("New chat", &[("⏎", "start"), ("Esc", "cancel")]);
+                let block = popup_block("Add friend", &[("⏎", "add"), ("Esc", "cancel")]);
                 let inner = block.inner(area).inner(Margin::new(2, 1));
                 f.render_widget(block, area);
                 let rows = Layout::vertical([Constraint::Length(1); 5]).split(inner);
@@ -789,7 +876,7 @@ impl App {
                     "Username",
                     user,
                     true,
-                    "who do you want to talk to?",
+                    "your friend's chatui username",
                 );
                 let known: Vec<&str> = self
                     .store
@@ -800,7 +887,7 @@ impl App {
                     .collect();
                 if !known.is_empty() {
                     f.render_widget(
-                        Line::from(format!("known: {}", known.join(", "))).fg(DIM),
+                        Line::from(format!("from your groups: {}", known.join(", "))).fg(DIM),
                         rows[2],
                     );
                 }
@@ -958,7 +1045,7 @@ impl App {
         match k.code {
             KeyCode::Tab => self.cycle_focus(false),
             KeyCode::BackTab => self.cycle_focus(true),
-            KeyCode::Char('n') => {
+            KeyCode::Char('f' | 'n') => {
                 self.popup = Some(Popup::NewChat {
                     user: Field::default(),
                     err: String::new(),
@@ -967,10 +1054,10 @@ impl App {
             KeyCode::Char('g') => {
                 let picks = self
                     .store
-                    .contacts
-                    .keys()
-                    .filter(|u| **u != self.me)
-                    .map(|u| (u.clone(), false))
+                    .chats
+                    .iter()
+                    .filter(|c| !c.group)
+                    .map(|c| (c.id.clone(), false))
                     .collect();
                 self.popup = Some(Popup::NewGroup {
                     name: Field::default(),

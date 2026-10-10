@@ -292,6 +292,7 @@ impl App {
                 }
                 self.setup = None;
                 self.attach(w, r);
+                self.notify("You're in! Press f to add your first friend.", false);
             }
         }
     }
