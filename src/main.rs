@@ -374,12 +374,16 @@ const USAGE: &str = "usage:
   chatui                         open the chat (first run asks for a username and server)
   chatui serve [addr]            run a relay server (default [::]:6769)
   chatui serve [addr] --admin U  ...and make user U its admin (can remove people)
+  chatui serve --invite          print an invite code (with the relay stopped)
+  chatui serve --release U       free username U to sign up again, e.g. after a
+                                 forgotten passphrase (with the relay stopped)
   chatui mcp                     MCP server so an AI can design themes
                                  (claude mcp add chatui -- chatui mcp)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let say = |m: String| println!("{m}");
     let serve = |addr: Option<&str>, admin| {
         server::run(
             addr.unwrap_or("[::]:6769"),
@@ -390,6 +394,8 @@ fn main() {
     let res = match args.as_slice() {
         ["serve"] => serve(None, None),
         ["serve", "--admin", u] => serve(None, Some(*u)),
+        ["serve", "--invite"] => server::invite_cmd(&home().join("server.json")).map(say),
+        ["serve", "--release", u] => server::release_cmd(&home().join("server.json"), u).map(say),
         ["serve", addr] => serve(Some(*addr), None),
         ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
         ["mcp"] => mcp::run(),
@@ -673,6 +679,58 @@ mod tests {
         // and he can be let back in
         assert!(req(&mut aw, "unban", "bob").users.is_empty());
         assert!(login("bob", &b, "").is_ok());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Someone lost their passphrase: the operator frees the name and hands out a
+    /// code, both with the relay stopped (a running relay holds a lock).
+    #[test]
+    fn operator_commands() {
+        let dir = std::env::temp_dir().join(format!("chatui-op-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("s.json");
+        let (old, new) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        let seed = serde_json::json!({
+            "users": {"alice": old.public_key().to_bytes(), "kuzea": old.public_key().to_bytes()},
+            "admin": "kuzea",
+        });
+        fs::write(&state, seed.to_string()).unwrap();
+
+        // a running relay holds the lock
+        let running = server::run("x", &state, None);
+        assert!(running.unwrap_err().contains("bind")); // it got the lock, then failed to bind
+        let held = {
+            let f = OpenOptions::new()
+                .write(true)
+                .open(state.with_extension("lock"))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        assert!(
+            server::invite_cmd(&state)
+                .unwrap_err()
+                .contains("stop it first")
+        );
+        drop(held);
+
+        assert!(server::release_cmd(&state, "nobody").is_err());
+        let msg = server::release_cmd(&state, "kuzea").unwrap();
+        assert!(msg.contains("was the admin"));
+        let code = server::invite_cmd(&state).unwrap();
+        let code = code.split_whitespace().nth(2).unwrap().to_string();
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let st = state.clone();
+        std::thread::spawn(move || server::serve(l, &st));
+        // kuzea is back with a new key; the code came from the relay, not a person
+        let back = handshake(&addr, "kuzea", &new, &code).unwrap();
+        assert_eq!((back.inviter.as_str(), back.admin), ("", false));
+        assert!(handshake(&addr, "eve", &old, &code).is_err()); // single use
         fs::remove_dir_all(dir).ok();
     }
 

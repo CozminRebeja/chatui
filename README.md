@@ -90,6 +90,9 @@ someone: they're logged out, can't log back in or be messaged, and their unused
 invites stop working. A relay from before 0.9 has no admin yet: run
 `chatui serve --admin <your username>` once.
 
+Someone forgot their passphrase? With the relay stopped, `chatui serve --release <name>`
+frees their username and `chatui serve --invite` prints a code to sign up with again.
+
 The relay speaks plain WebSocket, and clients only connect to it over TLS (wss),
 so put it behind something that terminates TLS with a real certificate, such as
 a Cloudflare Tunnel. `chat.example.com` connects on 443, `chat.example.com:8443`

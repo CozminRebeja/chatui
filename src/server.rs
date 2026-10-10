@@ -136,8 +136,9 @@ impl Write for Conn {
 }
 
 pub fn run(addr: &str, path: &Path, admin: Option<&str>) -> Result<(), String> {
+    let _lock = lock(path)?; // held for as long as the relay runs
     if let Some(a) = admin {
-        set_admin(path, a)?;
+        edit(path, |s| set_admin(s, a))?;
     }
     let l = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
     eprintln!(
@@ -148,16 +149,95 @@ pub fn run(addr: &str, path: &Path, admin: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// Make `user` the admin, before the relay starts (whoever can run this owns the relay anyway).
-fn set_admin(path: &Path, user: &str) -> Result<(), String> {
-    let b = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut state: State = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
+/// Held while a relay runs on `path`, so the commands below, which edit the state
+/// file directly, can't be overwritten by a running relay's next save.
+fn lock(path: &Path) -> Result<fs::File, String> {
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.with_extension("lock"))
+        .map_err(|e| e.to_string())?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(fs::TryLockError::WouldBlock) => Err(
+            "the relay is running: stop it first (e.g. brew services stop chatui), then try again"
+                .into(),
+        ),
+        Err(fs::TryLockError::Error(e)) => Err(e.to_string()),
+    }
+}
+
+/// Change the state file of a relay that isn't running (whoever can run this
+/// owns the relay anyway). Returns what `f` reports.
+fn edit<T>(path: &Path, f: impl FnOnce(&mut State) -> Result<T, String>) -> Result<T, String> {
+    let mut state: State = match fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => State::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let out = f(&mut state)?;
+    write_private(path, &serde_json::to_vec(&state).unwrap()).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+fn set_admin(state: &mut State, user: &str) -> Result<(), String> {
     if !state.users.contains_key(user) {
         return Err(format!("no user {user} on this relay"));
     }
     state.admin = user.into();
     state.banned.remove(user);
-    write_private(path, &serde_json::to_vec(&state).unwrap()).map_err(|e| e.to_string())
+    Ok(())
+}
+
+/// `chatui serve --invite`: an invite code from the relay itself, e.g. to let
+/// someone back in who lost their passphrase.
+pub fn invite_cmd(path: &Path) -> Result<String, String> {
+    let _lock = lock(path)?;
+    let code = edit(path, |s| {
+        let code = new_code();
+        let invite = Invite {
+            by: String::new(), // from the relay, not a person
+            expires: Utc::now() + chrono::Duration::days(INVITE_DAYS),
+        };
+        s.invites.insert(normalize_code(&code), invite);
+        Ok(code)
+    })?;
+    Ok(format!(
+        "invite code: {code} (single use, expires in {INVITE_DAYS} days)"
+    ))
+}
+
+/// `chatui serve --release U`: forget account U, so the name can sign up again
+/// with a new key (say, after a forgotten passphrase).
+pub fn release_cmd(path: &Path, user: &str) -> Result<String, String> {
+    let _lock = lock(path)?;
+    let was_admin = edit(path, |s| {
+        if s.users.remove(user).is_none() {
+            return Err(format!("no user {user} on this relay"));
+        }
+        s.joined.remove(user);
+        s.prekeys.remove(user);
+        s.queue.remove(user);
+        s.banned.remove(user);
+        s.invites.retain(|_, i| i.by != user);
+        let was_admin = s.admin == user;
+        if was_admin {
+            s.admin.clear();
+        }
+        Ok(was_admin)
+    })?;
+    let mut msg = format!(
+        "{user} is free to sign up again (with an invite code). Their friends will see a new \
+         key and have to remove and re-add them, then compare safety numbers."
+    );
+    if was_admin {
+        msg += &format!(
+            "\n{user} was the admin: once they're back, run `chatui serve --admin {user}` once."
+        );
+    }
+    Ok(msg)
 }
 
 pub fn serve(l: TcpListener, path: &Path) {
