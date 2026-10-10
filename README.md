@@ -38,6 +38,8 @@ choose *More info → Run anyway*. To check it's the real thing, compare its
 SHA-256 (`certutil -hashfile chatui.exe SHA256`) with the line in the release's
 `SHA256SUMS`, whose signature (`SHA256SUMS.asc`) is made with the apt key above.
 
+Check which version you have with `chatui --version`.
+
 ## Get started
 
 Run `chatui` and choose a passphrase: your key and messages are encrypted with
