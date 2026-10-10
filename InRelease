@@ -1,0 +1,29 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Date: Sat, 10 Oct 2026 14:38:47 +0000
+Label: chatui
+Origin: chatui
+MD5Sum:
+ 8088339248954b33d260d9be75850324             1450 Packages
+ 66915798a8fc325454e6970f9b5d6b68              709 Packages.gz
+ 393f55afb25dbbad896523ca1941218c               67 Release
+SHA1:
+ 7fdca4f5c8bfbb1002dc6cc9e8f1ccb72ee3e7fb             1450 Packages
+ 151fb2092ec024780f107ce1a4e1304559342229              709 Packages.gz
+ ee6f73363d56888a8958c2627bebc428697e8000               67 Release
+SHA256:
+ 08b3c0abe6f485abe5e2cfc18603e67169b5aca2405018102e0ca0850bebd27c             1450 Packages
+ 23a9e8aeea2c16c0e28e2b719279a6fab75fd025ce1e4fd092a4c21c2f7e2142              709 Packages.gz
+ 2ff48d97e18613f82cbb120c73e99197421ee2aae9855fb7cc61da0102f5b233               67 Release
+SHA512:
+ 3534cf520bad0f4c6db1ed32bdb713963f4525b6570d09e84beafe8f818672c027b81f3e14460fed1ed42b79f973d2274dd50fc5f5491ab3d78ab9c95db1138d             1450 Packages
+ b58c2bcc817ef96b81daac3032fefd3be7e8b47d478302d0a2cd51b2c15342beb42ab849e70e296bbfdacec7fdd14a27cd4d372a7e47eab8a5d40090db8fb129              709 Packages.gz
+ 7debc8713a212183f7b6ca13c614dee8a4fc94a0f1ccd7ff7102939f7726593afc346b7b4ac9c1df9059364d7f5b2f496e290d5d3b8db454fb0a2cbf7547c98b               67 Release
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQRJ33PNRBokxFXeYlqvQS4KacyWXwUCaspN9wAKCRCvQS4KacyW
+Xy5bAQDaNTNfYYfBTYytGiAF5tWsX2g/5VR80Y6/SIYjrpj8XgD/Xskscd1sMqEe
+OvlsV+TL6AK8E+j0UeP3NuUQ17+4twE=
+=qS/q
+-----END PGP SIGNATURE-----
