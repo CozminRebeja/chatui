@@ -75,6 +75,7 @@ Type these in the message box:
 | `/leave` | leave the open group (the admin can't leave yet) |
 | `/receipts on` / `off` | show or hide read receipts |
 | `/notify on` / `off` | desktop notifications for new messages (Linux, macOS, Windows) |
+| `/notify hide` / `show` | notifications say only "New message", or show who and what |
 | `/tutorial` / `/help` | the first-run tour again / every key |
 
 Whoever makes a group is its admin. Only the admin, or a member the admin has

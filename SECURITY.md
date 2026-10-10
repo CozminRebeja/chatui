@@ -27,7 +27,7 @@ chatui encrypts your messages end to end. The relay only passes along ciphertext
   can't leave or hand over the role yet.
 - **Notifications on screen.** `/notify` shows the sender and the first 100
   characters of a message on your desktop, where anyone looking at the screen
-  can see them.
+  can see them. `/notify hide` shows only "New message" instead.
 
 ## Reporting a problem
 

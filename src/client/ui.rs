@@ -1087,6 +1087,7 @@ impl App {
                     key("/leave", "leave the open group"),
                     key("/receipts on|off", "show or hide read receipts"),
                     key("/notify on|off", "desktop notifications"),
+                    key("/notify hide|show", "hide who and what in notifications"),
                     key("/tutorial", "the first-run tour again"),
                     Line::default(),
                     head("Themes"),
