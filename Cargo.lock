@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "chatui"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "argon2",
  "chrono",
