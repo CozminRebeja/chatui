@@ -1,3 +1,4 @@
+mod backup;
 mod client;
 mod mcp;
 mod server;
@@ -378,7 +379,9 @@ const USAGE: &str = "usage:
   chatui serve --release U       free username U to sign up again, e.g. after a
                                  forgotten passphrase (with the relay stopped)
   chatui mcp                     MCP server so an AI can design themes
-                                 (claude mcp add chatui -- chatui mcp)";
+                                 (claude mcp add chatui -- chatui mcp)
+  chatui backup <file>           save your account (encrypted; chats not included)
+  chatui restore <file>          put a saved account back [--force to replace]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -399,6 +402,14 @@ fn main() {
         ["serve", addr] => serve(Some(*addr), None),
         ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
         ["mcp"] => mcp::run(),
+        ["backup", file] => backup::backup(&home(), Path::new(file))
+            .map(|_| println!("saved to {file}; keep it private, and remember your passphrase")),
+        ["restore", file] => {
+            backup::restore(Path::new(file), &home(), false).map(|_| println!("account restored"))
+        }
+        ["restore", file, "--force"] => {
+            backup::restore(Path::new(file), &home(), true).map(|_| println!("account restored"))
+        }
         [] => client::run(),
         _ => Err(USAGE.into()),
     };

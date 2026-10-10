@@ -32,6 +32,10 @@ struct Store {
     verified: BTreeMap<String, Key>,
     /// Key pins from an invite code, waiting for that person's key to arrive.
     expect: BTreeMap<String, String>,
+    /// The tour step to show next, saved after every move, so a tour cut short
+    /// by quitting resumes where it stopped. None when there's no tour to show.
+    #[serde(default)]
+    tutorial: Option<usize>,
 }
 
 impl Store {
@@ -338,6 +342,7 @@ pub fn run() -> Result<(), String> {
         theme_err: String::new(),
     };
     app.reload_theme();
+    app.resume_tutorial();
     if app.setup.is_none() {
         app.connect();
     }
@@ -410,6 +415,32 @@ impl App {
                 self.theme_err = e;
             }
             Err(_) => {}
+        }
+    }
+
+    /// Opens the tour from the first step, and saves that it's in progress.
+    fn start_tutorial(&mut self) {
+        self.set_tutorial_step(0);
+        self.popup = Some(Popup::Tutorial(0));
+    }
+
+    /// Records the tour's current step, so it survives quitting mid-tour.
+    fn set_tutorial_step(&mut self, step: usize) {
+        self.store.tutorial = Some(step);
+        self.commit();
+    }
+
+    /// Closes the tour for good.
+    fn finish_tutorial(&mut self) {
+        self.popup = None;
+        self.store.tutorial = None;
+        self.commit();
+    }
+
+    /// On startup, pick up a tour that was cut short.
+    fn resume_tutorial(&mut self) {
+        if let (Some(step), true) = (self.store.tutorial, self.setup.is_none()) {
+            self.popup = Some(Popup::Tutorial(step));
         }
     }
 
@@ -530,6 +561,7 @@ impl App {
                 } else {
                     self.notify("You're in! Press v to invite your friends.", false);
                 }
+                self.start_tutorial();
             }
         }
     }
@@ -2088,5 +2120,60 @@ mod tests {
         // ordinary text and emoji with joiners are untouched
         assert_eq!(clean("ăîșț 😀"), "ăîșț 😀");
         assert_eq!(clean("👨\u{200D}👩\u{200D}👧"), "👨\u{200D}👩\u{200D}👧");
+    }
+
+    #[test]
+    fn tutorial_opens_on_command_and_closes_once_seen() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        assert!(alice.store.tutorial.is_none());
+
+        alice.focus = Focus::Input;
+        for c in "/tutorial".chars() {
+            alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(0))));
+        assert!(
+            alice.input.text.is_empty(),
+            "/tutorial is not sent as a message"
+        );
+
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(1))),
+            "Enter goes to the next step"
+        );
+
+        alice.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(alice.popup.is_none());
+        assert!(alice.store.tutorial.is_none(), "closing it for good");
+        fs::remove_file(&state).ok();
+    }
+
+    /// Quitting mid-tour: the step is on disk, and the next start picks it up.
+    #[test]
+    fn tutorial_resumes_after_quitting_midway() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.start_tutorial();
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(2))));
+
+        // as if the app was killed here: read the saved history back from disk
+        let saved = load_store(&alice.dir, &alice.vault).unwrap();
+        assert_eq!(saved.tutorial, Some(2));
+
+        alice.popup = None;
+        alice.store = saved;
+        alice.resume_tutorial();
+        assert!(
+            matches!(alice.popup, Some(Popup::Tutorial(2))),
+            "resumes at step 3"
+        );
+        fs::remove_file(&state).ok();
     }
 }

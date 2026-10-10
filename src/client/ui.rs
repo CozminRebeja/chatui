@@ -23,6 +23,8 @@ pub enum Focus {
 
 pub enum Popup {
     Help,
+    /// The first-run tour, at this step.
+    Tutorial(usize),
     Info,
     Delete,
     Account {
@@ -195,6 +197,43 @@ fn pane<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
         .border_style(Style::new().fg(if focused { th().accent } else { th().dim }))
         .title(title)
 }
+
+/// The first-run tour: title, then the lines for that step.
+const TUTORIAL: [(&str, &[&str]); 5] = [
+    (
+        "Add a friend",
+        &["Press f and type their username. They need an account on this relay."],
+    ),
+    (
+        "Invite people",
+        &[
+            "Press v to make a one-time invite code. Send it to someone you trust.",
+            "Codes work once and expire after 7 days.",
+        ],
+    ),
+    (
+        "Talk",
+        &[
+            "Pick a chat with ↑ ↓ and press Tab to start typing. Enter sends.",
+            "Type @name to mention someone; reply to a message with r.",
+        ],
+    ),
+    (
+        "Check it's really them",
+        &[
+            "Press i in a chat to see its safety number. Compare it in person or over",
+            "another app. When it matches, press m to mark the contact verified.",
+        ],
+    ),
+    (
+        "Keep your account safe",
+        &[
+            "Run chatui backup <file> to save your account, and keep the file private.",
+            "You'll still need your passphrase to use a backup.",
+            "? or /help lists every key. /tutorial shows this tour again.",
+        ],
+    ),
+];
 
 fn popup_block<'a>(title: &'a str, hints: &[(&'a str, &'a str)]) -> Block<'a> {
     Block::bordered()
@@ -989,10 +1028,27 @@ impl App {
         f.render_widget(hint_line(hints), area);
     }
 
+    fn draw_tutorial(&self, f: &mut Frame, step: usize) {
+        let (title, lines) = TUTORIAL[step.min(TUTORIAL.len() - 1)];
+        let area = centered(f.area(), 66, 13);
+        f.render_widget(Clear, area);
+        let heading = format!("Getting started · {} of {}", step + 1, TUTORIAL.len());
+        let block = popup_block(
+            &heading,
+            &[("⏎ / →", "next"), ("←", "back"), ("Esc", "close")],
+        );
+        let inner = block.inner(area).inner(Margin::new(2, 1));
+        f.render_widget(block, area);
+        let mut text = vec![Line::from(title).bold().fg(th().bright), Line::default()];
+        text.extend(lines.iter().map(|l| Line::from(*l)));
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+    }
+
     fn draw_popup(&self, f: &mut Frame) {
         let screen = f.area();
         match &self.popup {
             None => {}
+            Some(Popup::Tutorial(step)) => self.draw_tutorial(f, *step),
             Some(Popup::Help) => {
                 let key = |k: &'static str, d: &'static str| {
                     Line::from(vec![format!("  {k:<18}").fg(th().accent).bold(), d.into()])
@@ -1765,6 +1821,9 @@ impl App {
                 if text == "/help" {
                     self.input.take();
                     self.popup = Some(Popup::Help);
+                } else if text == "/tutorial" {
+                    self.input.take();
+                    self.start_tutorial();
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
@@ -1781,6 +1840,28 @@ impl App {
     fn key_popup(&mut self, mut p: Popup, k: KeyEvent) {
         let esc = k.code == KeyCode::Esc;
         let keep = match &mut p {
+            Popup::Tutorial(step) => match k.code {
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('n') => {
+                    if *step + 1 < TUTORIAL.len() {
+                        *step += 1;
+                        self.set_tutorial_step(*step);
+                        true
+                    } else {
+                        self.finish_tutorial();
+                        false
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('p') => {
+                    *step = step.saturating_sub(1);
+                    self.set_tutorial_step(*step);
+                    true
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.finish_tutorial();
+                    false
+                }
+                _ => true,
+            },
             Popup::Help => {
                 !matches!(
                     k.code,
