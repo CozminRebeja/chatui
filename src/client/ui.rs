@@ -1878,10 +1878,28 @@ impl App {
                             self.commit();
                             self.notify("desktop notifications on", false);
                         }
+                        "hide" => {
+                            self.store.hide_alert_text = true;
+                            self.commit();
+                            self.notify("notifications now say only \"New message\"", false);
+                        }
+                        "show" => {
+                            self.store.hide_alert_text = false;
+                            self.commit();
+                            self.notify("notifications show who and what again", false);
+                        }
                         _ => {
                             let state = if self.store.no_alerts { "off" } else { "on" };
+                            let text = if self.store.hide_alert_text {
+                                "hidden"
+                            } else {
+                                "shown"
+                            };
                             self.notify(
-                                format!("desktop notifications are {state} (/notify on or off)"),
+                                format!(
+                                    "desktop notifications are {state}, message text {text} \
+                                     (/notify on|off, /notify hide|show)"
+                                ),
                                 false,
                             );
                         }

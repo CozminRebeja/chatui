@@ -33,6 +33,9 @@ struct Store {
     /// Set with `/notify off`: no desktop notifications for new messages.
     #[serde(default)]
     no_alerts: bool,
+    /// Set with `/notify hide`: notifications say only "New message", not who or what.
+    #[serde(default)]
+    hide_alert_text: bool,
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
     /// Keys we compared in person (safety numbers) or got through an invite code.
@@ -1550,8 +1553,13 @@ impl App {
                 let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
                 let ts = m.ts.clamp(epoch, Utc::now());
                 let open_chat = self.sel == ci;
-                let alert = (!self.store.no_alerts && !(self.focused && open_chat))
-                    .then(|| alert_text(&from, c.group.then_some(c.name.as_str()), &text));
+                let alert = (!self.store.no_alerts && !(self.focused && open_chat)).then(|| {
+                    if self.store.hide_alert_text {
+                        "New message".to_string()
+                    } else {
+                        alert_text(&from, c.group.then_some(c.name.as_str()), &text)
+                    }
+                });
                 let ping = mentions_user(&text, &self.me).then(|| {
                     let place = if c.group {
                         format!(" in #{}", c.name)
@@ -2475,6 +2483,26 @@ mod tests {
             matches!(alice.popup, Some(Popup::Tutorial(0))),
             "the tour stays open"
         );
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn notify_hide_and_show_toggle_the_text() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let mut type_line = |alice: &mut App, line: &str| {
+            alice.focus = Focus::Input;
+            for c in line.chars() {
+                alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        assert!(!alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify hide");
+        assert!(alice.store.hide_alert_text);
+        type_line(&mut alice, "/notify show");
+        assert!(!alice.store.hide_alert_text);
         fs::remove_file(&state).ok();
     }
 
