@@ -1,0 +1,113 @@
+# Push a v* tag (or run by hand) to attach the .debs and chatui.exe to the
+# GitHub release and publish the apt repo to GitHub Pages (gh-pages branch).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: tag
+        run: |
+          tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml ($tag)"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          gh release view "$tag" >/dev/null 2>&1 ||
+            gh release create "$tag" --title "$tag" --notes "" --target "$GITHUB_SHA"
+
+  deb:
+    needs: release
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo install cargo-deb --locked
+      # static musl binary, so one .deb runs on any Debian/Ubuntu release
+      - run: cargo deb --target ${{ matrix.target }} --output dist/
+        env:
+          # prefilled on the first-run screen, same as the Homebrew formula
+          CHATUI_SERVER: chat.rebeja.co
+      - run: gh release upload "${{ needs.release.outputs.tag }}" dist/*.deb --clobber
+
+  windows:
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+        env:
+          CHATUI_SERVER: chat.rebeja.co
+          # static CRT, so it runs without the Visual C++ redistributable
+          RUSTFLAGS: -C target-feature=+crt-static
+      - run: gh release upload "${{ needs.release.outputs.tag }}" target/release/chatui.exe --clobber
+
+  # Opens the PR to microsoft/winget-pkgs. The first version has to be submitted
+  # by hand; after that set WINGET_TOKEN (classic PAT, public_repo scope).
+  winget:
+    needs: [release, windows]
+    runs-on: ubuntu-24.04
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: CozminRebeja.chatui
+          release-tag: ${{ needs.release.outputs.tag }}
+          installers-regex: '\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  apt:
+    needs: [release, deb]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: gh release download "${{ needs.release.outputs.tag }}" -p '*.deb' -D repo
+      - name: Index and sign
+        working-directory: repo
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+        run: |
+          echo "$APT_GPG_KEY" | gpg --batch --import
+          gpg --export > chatui.gpg
+          apt-ftparchive packages . > Packages
+          gzip -k9 Packages
+          apt-ftparchive -o APT::FTPArchive::Release::Origin=chatui \
+            -o APT::FTPArchive::Release::Label=chatui release . > Release
+          gpg --batch --yes --clearsign -o InRelease Release
+          gpg --batch --yes -abs -o Release.gpg Release
+          touch .nojekyll
+      - name: Push to gh-pages
+        working-directory: repo
+        run: |
+          git init -q -b gh-pages
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com \
+            commit -qm "apt repo ${{ needs.release.outputs.tag }}"
+          git push -f "https://x-access-token:$GH_TOKEN@github.com/$GH_REPO.git" gh-pages
