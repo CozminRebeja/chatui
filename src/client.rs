@@ -64,6 +64,16 @@ struct Chat {
     /// to it or read-receipt it until we do.
     #[serde(default)]
     pending: bool,
+    /// Who made the group. Only the admin can grant or revoke removal rights.
+    /// Empty for groups made before admins existed: nobody can remove people there.
+    #[serde(default)]
+    admin: String,
+    /// Members the admin has let remove people.
+    #[serde(default)]
+    helpers: Vec<String>,
+    /// We were removed (or left): history stays, but we no longer send.
+    #[serde(default)]
+    removed: bool,
 }
 
 impl Chat {
@@ -76,6 +86,9 @@ impl Chat {
             msgs: vec![],
             created: Utc::now(),
             pending: false,
+            admin: String::new(),
+            helpers: vec![],
+            removed: false,
         }
     }
     fn last_activity(&self) -> DateTime<Utc> {
@@ -142,6 +155,9 @@ struct Payload {
     name: String,
     members: BTreeMap<String, Key>,
     reply: Option<Quote>,
+    /// Group admin, sent with invites.
+    #[serde(default)]
+    admin: String,
 }
 
 enum Ev {
@@ -232,6 +248,19 @@ fn notify_desktop(body: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(["--app-name=chatui", "chatui", body])
         .spawn();
+}
+
+/// May `who` remove `target` from the group? The admin can remove anyone but
+/// themselves. A member the admin has let remove people can remove members,
+/// but not the admin or another such member.
+fn may_remove(c: &Chat, who: &str, target: &str) -> bool {
+    if c.admin.is_empty() || target == c.admin || target == who {
+        return false;
+    }
+    if who == c.admin {
+        return true;
+    }
+    c.helpers.iter().any(|h| h == who) && !c.helpers.iter().any(|h| h == target)
 }
 
 /// Strips control characters and invisible direction marks, which can make a name
@@ -494,6 +523,132 @@ impl App {
             false,
         );
         Ok(())
+    }
+
+    /// The open group, if we can still act in it.
+    fn open_group(&self) -> Result<usize, String> {
+        match self.store.chats.get(self.sel) {
+            Some(c) if c.group && c.removed => Err("you're no longer in this group".into()),
+            Some(c) if c.group && !c.pending => Ok(self.sel),
+            Some(c) if c.group => Err("join the group first (y)".into()),
+            _ => Err("open a group first".into()),
+        }
+    }
+
+    /// Sends a membership change to everyone in the group, and to `extra` if given.
+    fn announce(&mut self, ci: usize, p: Payload, extra: Option<&str>) {
+        let mut to = self.store.chats[ci].members.clone();
+        to.extend(extra.map(String::from));
+        for u in to {
+            self.send_to(&u, "", &p);
+        }
+    }
+
+    /// Removes `user` from the open group, if our rights allow it.
+    pub(super) fn remove_member(&mut self, user: &str) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        if !may_remove(c, &self.me, user) {
+            return Err(if c.admin == self.me || c.helpers.contains(&self.me) {
+                format!("you can't remove {user}")
+            } else {
+                "only the group admin, or someone they've allowed, can remove people".into()
+            });
+        }
+        let p = Payload {
+            t: "remove".into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            ..Default::default()
+        };
+        self.announce(ci, p, Some(user));
+        let c = &mut self.store.chats[ci];
+        c.members.retain(|m| m != user);
+        c.helpers.retain(|m| m != user);
+        c.msgs.push(notice(format!("you removed {user}")));
+        self.commit();
+        Ok(())
+    }
+
+    /// Lets `user` remove people from the open group, or takes that back. Admin only.
+    pub(super) fn set_helper(&mut self, user: &str, grant: bool) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin != self.me {
+            return Err("only the group admin can change who may remove people".into());
+        }
+        if !c.members.iter().any(|m| m == user) {
+            return Err(format!("{user} isn't in this group"));
+        }
+        if c.helpers.iter().any(|h| h == user) == grant {
+            return Err(if grant {
+                format!("{user} can already remove people")
+            } else {
+                format!("{user} can't remove people")
+            });
+        }
+        let p = Payload {
+            t: if grant { "grant" } else { "revoke" }.into(),
+            chat: c.id.clone(),
+            ids: vec![user.into()],
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        if grant {
+            c.helpers.push(user.into());
+            c.msgs.push(notice(format!("you let {user} remove people")));
+        } else {
+            c.helpers.retain(|h| h != user);
+            c.msgs
+                .push(notice(format!("you stopped {user} removing people")));
+        }
+        self.commit();
+        Ok(())
+    }
+
+    /// Leaves the open group. The admin can't leave, since there's no handover yet.
+    pub(super) fn leave_group(&mut self) -> Result<(), String> {
+        let ci = self.open_group()?;
+        let c = &self.store.chats[ci];
+        if c.admin == self.me {
+            return Err("the group admin can't leave yet".into());
+        }
+        let p = Payload {
+            t: "leave".into(),
+            chat: c.id.clone(),
+            ..Default::default()
+        };
+        self.announce(ci, p, None);
+        let c = &mut self.store.chats[ci];
+        c.removed = true;
+        c.members.clear();
+        c.helpers.clear();
+        c.msgs.push(notice("you left".into()));
+        self.commit();
+        Ok(())
+    }
+
+    /// `/remove`, `/grant`, `/revoke` and `/leave` in the message box.
+    /// Returns None when the text isn't one of these.
+    pub(super) fn group_command(&mut self, text: &str) -> Option<Result<(), String>> {
+        let (cmd, arg) = text
+            .split_once(' ')
+            .map_or((text, ""), |(c, a)| (c, a.trim()));
+        let needs_name = matches!(cmd, "/remove" | "/grant" | "/revoke");
+        if needs_name && arg.is_empty() {
+            return Some(Err(format!("usage: {cmd} <name>")));
+        }
+        match cmd {
+            "/remove" => Some(self.remove_member(arg)),
+            "/grant" => Some(self.set_helper(arg, true)),
+            "/revoke" => Some(self.set_helper(arg, false)),
+            "/leave" => Some(self.leave_group()),
+            _ => None,
+        }
     }
 
     fn notify(&mut self, msg: impl Into<String>, err: bool) {
@@ -810,6 +965,9 @@ impl App {
     }
 
     fn send_text(&mut self, text: String) {
+        if self.store.chats.get(self.sel).is_some_and(|c| c.removed) {
+            return self.notify("you're no longer in this group", true);
+        }
         let Some(c) = self.store.chats.get(self.sel) else {
             return self.notify("start a chat first (n)", true);
         };
@@ -1211,12 +1369,15 @@ impl App {
                 chat: id.clone(),
                 name: p.group.clone(),
                 members,
+                admin: self.me.clone(),
                 ..Default::default()
             };
             for u in &p.users {
                 self.send_to(u, "", &invite);
             }
-            self.add_chat(Chat::new(id, p.group, p.users, true))
+            let mut c = Chat::new(id, p.group, p.users, true);
+            c.admin = self.me.clone();
+            self.add_chat(c)
         };
         self.sel = ci;
         self.scroll = 0;
@@ -1250,6 +1411,7 @@ impl App {
             chat: id.clone(),
             name,
             members,
+            admin: self.store.chats[ci].admin.clone(),
             ..Default::default()
         };
         let added = Payload {
@@ -1431,6 +1593,11 @@ impl App {
                     name = "group".into();
                 }
                 let mut c = Chat::new(m.chat, name, members, true);
+                c.admin = if valid_name(&m.admin) {
+                    m.admin.clone()
+                } else {
+                    String::new()
+                };
                 c.pending = true;
                 c.msgs
                     .push(notice(format!("{from} added you · y joins, d declines")));
@@ -1440,6 +1607,53 @@ impl App {
                     false,
                 );
                 self.sync_keys();
+            }
+            "remove" | "grant" | "revoke" | "leave" => {
+                let Some(ci) = self.find(&m.chat).filter(|_| !m.chat.is_empty()) else {
+                    return;
+                };
+                let target = m.ids.first().cloned().unwrap_or_default();
+                let me = self.me.clone();
+                let c = &mut self.store.chats[ci];
+                match m.t.as_str() {
+                    "remove" => {
+                        if !may_remove(c, &from, &target) {
+                            return;
+                        }
+                        if target == me {
+                            c.removed = true;
+                            c.members.clear();
+                            c.helpers.clear();
+                            c.msgs
+                                .push(notice(format!("{from} removed you from this group")));
+                        } else {
+                            c.members.retain(|u| *u != target);
+                            c.helpers.retain(|u| *u != target);
+                            c.msgs.push(notice(format!("{from} removed {target}")));
+                        }
+                    }
+                    "grant" | "revoke" => {
+                        if from != c.admin || target.is_empty() {
+                            return;
+                        }
+                        let grant = m.t == "grant";
+                        c.helpers.retain(|u| *u != target);
+                        if grant {
+                            c.helpers.push(target.clone());
+                        }
+                        let what = if grant { "let" } else { "stopped" };
+                        c.msgs
+                            .push(notice(format!("{from} {what} {target} remove people")));
+                    }
+                    _ => {
+                        if !c.members.contains(&from) {
+                            return;
+                        }
+                        c.members.retain(|u| *u != from);
+                        c.helpers.retain(|u| *u != from);
+                        c.msgs.push(notice(format!("{from} left")));
+                    }
+                }
             }
             "rename" => {
                 let Some(ci) = self.find(&m.chat) else { return };
@@ -2339,6 +2553,103 @@ mod tests {
             a.store.contacts.get("bob") == Some(&pk(&bob))
         });
         assert!(!alice.verified("bob"), "the new key must be checked again");
+    }
+
+    #[test]
+    fn may_remove_rules() {
+        let mut c = Chat::new(
+            "g1".into(),
+            "trip".into(),
+            vec!["bob".into(), "carol".into(), "dave".into()],
+            true,
+        );
+        c.admin = "alice".into();
+        assert!(may_remove(&c, "alice", "bob"));
+        assert!(
+            !may_remove(&c, "alice", "alice"),
+            "the admin can't remove themselves"
+        );
+        assert!(!may_remove(&c, "bob", "carol"), "ordinary members can't");
+        c.helpers.push("bob".into());
+        assert!(may_remove(&c, "bob", "carol"));
+        assert!(!may_remove(&c, "bob", "alice"), "never the admin");
+        c.helpers.push("carol".into());
+        assert!(
+            !may_remove(&c, "bob", "carol"),
+            "helpers can't remove helpers"
+        );
+        c.admin.clear();
+        assert!(
+            !may_remove(&c, "bob", "dave"),
+            "old groups without an admin: nobody"
+        );
+    }
+
+    #[test]
+    fn group_rules_admin_helpers_and_leaving() {
+        let (addr, state) = relay();
+        let (mut alice, ra) = app(&addr, "alice", "");
+        let code = invite(&mut alice, &ra);
+        let (mut bob, rb) = app(&addr, "bob", &code);
+        let code = invite(&mut alice, &ra);
+        let (mut carol, rc) = app(&addr, "carol", &code);
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        settle(&mut alice, &ra);
+        let gid = group(&alice).unwrap().id.clone();
+        join(&mut bob, &rb, &gid);
+        join(&mut carol, &rc, &gid);
+        for a in [&mut alice, &mut bob, &mut carol] {
+            a.sel = a.find(&gid).unwrap();
+        }
+
+        // ordinary members can't remove anyone or hand out rights
+        assert!(bob.remove_member("carol").is_err());
+        assert!(bob.set_helper("carol", true).is_err());
+
+        // the admin lets bob remove people; bob removes carol
+        alice.set_helper("bob", true).unwrap();
+        settle(&mut alice, &ra);
+        until(&mut bob, &rb, |a| {
+            group(a).is_some_and(|c| c.helpers.contains(&"bob".into()))
+        });
+        bob.remove_member("carol").unwrap();
+        settle(&mut bob, &rb);
+        until(&mut carol, &rc, |a| group(a).is_some_and(|c| c.removed));
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"carol".into()))
+        });
+
+        // a removed member can't send any more
+        carol.send_text("still here?".into());
+        assert!(
+            group(&carol)
+                .unwrap()
+                .msgs
+                .iter()
+                .all(|m| m.text != "still here?")
+        );
+
+        // a forged removal of the admin is ignored
+        let forged = Payload {
+            t: "remove".into(),
+            chat: gid.clone(),
+            ids: vec!["alice".into()],
+            ..Default::default()
+        };
+        forge(&mut bob, &rb, &alice, forged);
+        settle(&mut alice, &ra);
+        assert!(!group(&alice).unwrap().removed);
+
+        // the admin can't leave; bob can
+        assert!(alice.leave_group().is_err());
+        bob.leave_group().unwrap();
+        until(&mut alice, &ra, |a| {
+            group(a).is_some_and(|c| !c.members.contains(&"bob".into()))
+        });
+        assert!(group(&bob).unwrap().removed);
         fs::remove_file(&state).ok();
     }
 

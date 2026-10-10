@@ -1880,6 +1880,11 @@ impl App {
                     } else if let Err(e) = self.accept_new_key(name) {
                         self.notify(e, true);
                     }
+                } else if let Some(res) = self.group_command(&text) {
+                    self.input.take();
+                    if let Err(e) = res {
+                        self.notify(e, true);
+                    }
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
