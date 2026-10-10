@@ -974,6 +974,49 @@ mod tests {
         assert!(open(&a_pub, &b, &ct[..10]).is_none(), "truncated");
     }
 
+    /// One account can't use up someone's one-time prekeys: after a few it gets the
+    /// fallback key, and the rest stay for everyone else.
+    #[test]
+    fn prekeys_cant_be_drained_by_one_account() {
+        let (addr, dir) = test_server("drain");
+        let (a, b) = (
+            SecretKey::generate(&mut OsRng),
+            SecretKey::generate(&mut OsRng),
+        );
+        let mut aw = handshake(&addr, "alice", &a, "").unwrap().ws;
+        let otks: Vec<Key> = (1..=10u8).map(|i| [i; 32]).collect();
+        let fallback = [99u8; 32];
+        let publish = |otks: Vec<Key>, key| Pkt {
+            t: "prekeys".into(),
+            otks,
+            key,
+            ..Default::default()
+        };
+        assert!(send(&mut aw, &publish(otks.clone(), Some(fallback))));
+        assert_eq!(recv(&mut aw).unwrap().count, 10);
+        send_pkt(&mut aw, "invite", "", "", vec![]);
+        let code = recv(&mut aw).unwrap().id;
+        let mut bw = handshake(&addr, "bob", &b, &code).unwrap().ws;
+
+        let mut got = vec![];
+        for _ in 0..5 {
+            let claim = Pkt {
+                t: "claim".into(),
+                users: vec!["alice".into()],
+                ..Default::default()
+            };
+            assert!(send(&mut bw, &claim));
+            got.push(recv(&mut bw).unwrap().keys["alice"]);
+        }
+        assert_eq!(&got[..3], &otks[..3], "the first few are one-time keys");
+        assert_eq!(&got[3..], &[fallback, fallback], "then the fallback");
+
+        // the other seven are still there for someone else
+        assert!(send(&mut aw, &publish(vec![], None)));
+        assert_eq!(recv(&mut aw).unwrap().count, 7);
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn usernames_are_restricted() {
         assert!(valid_name("alice_1-x"));

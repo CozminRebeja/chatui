@@ -16,6 +16,10 @@ const MAX_CONNS: usize = 512;
 const MAX_LOGINS: usize = 64; // connections that haven't logged in yet
 const MAX_KEYS: usize = 256; // users per key lookup
 const MAX_PREKEYS: usize = 50; // one-time prekeys held per user
+/// One-time prekeys one account may take from one person per hour; after that it
+/// gets their fallback key, so nobody can use up someone else's one-time keys.
+const MAX_OTK_CLAIMS: usize = 3;
+const CLAIM_WINDOW: Duration = Duration::from_secs(3600);
 /// The whole login, not each read: a client dripping bytes can't hold a slot forever.
 const LOGIN: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 const MAX_INVITES: usize = 3; // unused ones per person
@@ -79,6 +83,8 @@ struct Server {
     path: PathBuf,
     dirty: bool, // queue changed since the last save
     sent: HashMap<String, VecDeque<(Instant, String)>>, // each user's sends in the last minute; not saved
+    /// One-time prekeys taken in the last hour, by (who asked, whose); not saved.
+    claimed: HashMap<(String, String), VecDeque<Instant>>,
 }
 
 impl Server {
@@ -271,6 +277,7 @@ pub fn serve(l: TcpListener, path: &Path) {
         path: path.into(),
         dirty: false,
         sent: HashMap::new(),
+        claimed: HashMap::new(),
     })));
     // offline messages are saved in batches, so a burst of them isn't a burst of rewrites
     std::thread::spawn(|| {
@@ -558,14 +565,21 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
                     return;
                 }
                 let mut keys = BTreeMap::new();
+                let now = Instant::now();
+                let s = &mut *s; // so `claimed` and `state` can be borrowed side by side
                 for u in &p.users {
                     if s.state.banned.contains(u) {
                         continue;
                     }
+                    let taken = s.claimed.entry((user.clone(), u.clone())).or_default();
+                    while taken.front().is_some_and(|t| now - *t >= CLAIM_WINDOW) {
+                        taken.pop_front();
+                    }
                     if let Some(pk) = s.state.prekeys.get_mut(u) {
-                        let k = if pk.otks.is_empty() {
+                        let k = if pk.otks.is_empty() || taken.len() >= MAX_OTK_CLAIMS {
                             pk.fallback
                         } else {
+                            taken.push_back(now);
                             Some(pk.otks.remove(0))
                         };
                         if let Some(k) = k {
@@ -638,6 +652,7 @@ mod tests {
             path: PathBuf::from("unused"),
             dirty: false,
             sent: HashMap::new(),
+            claimed: HashMap::new(),
         });
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = relay_state(&m);
