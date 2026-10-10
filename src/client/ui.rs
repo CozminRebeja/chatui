@@ -1077,6 +1077,18 @@ impl App {
                     key("a", "account & server"),
                     key("B", "relay admins: remove people"),
                     Line::default(),
+                    head("Commands (type in the message box)"),
+                    key(
+                        "/accept <name>",
+                        "accept a new key, after comparing numbers",
+                    ),
+                    key("/remove <name>", "group admin: remove someone"),
+                    key("/grant, /revoke", "group admin: let a member remove people"),
+                    key("/leave", "leave the open group"),
+                    key("/receipts on|off", "show or hide read receipts"),
+                    key("/notify on|off", "desktop notifications (Linux)"),
+                    key("/tutorial", "the first-run tour again"),
+                    Line::default(),
                     head("Themes"),
                     key("t  or  Ctrl-T", "pick a theme (Ctrl-T works while typing)"),
                     Line::from(vec![
