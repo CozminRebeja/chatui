@@ -15,6 +15,8 @@ const KDF: (u32, u32, u32) = if cfg!(test) {
 } else {
     (64 * 1024, 3, 1)
 };
+/// The most any key.json may ask for: 1 GiB, 10 passes, 8 lanes. Far above KDF.
+const MAX_KDF: (u32, u32, u32) = (1 << 20, 10, 8);
 const CHECK: &[u8] = b"chatui-vault-v1";
 const WRONG: &str = "wrong passphrase";
 pub const MIN_PASS: usize = 8;
@@ -110,6 +112,11 @@ impl Vault {
         let salt = unhex(&kf.salt)
             .and_then(|s| s.try_into().ok())
             .ok_or("key.json is corrupt")?;
+        // the cost settings come from the file: a crafted one (say, in a backup someone
+        // hands you) must not make unlocking eat all the memory or run for hours
+        if kf.m > MAX_KDF.0 || kf.t > MAX_KDF.1 || kf.p > MAX_KDF.2 {
+            return Err("key.json asks for more work than chatui ever uses: refusing".into());
+        }
         let v = Vault::derive(pass, salt, (kf.m, kf.t, kf.p))?;
         match v.open(&kf.check) {
             Some(c) if c == CHECK => Ok(v),
@@ -294,6 +301,24 @@ mod tests {
         // so is plaintext swapped in for an encrypted file
         fs::write(dir.join("store.json"), b"{\"contacts\": {}}").unwrap();
         assert!(v.read(&dir.join("store.json")).is_err());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A key.json asking for absurd work (say, from a crafted backup) is refused
+    /// before any of it is done.
+    #[test]
+    fn absurd_cost_settings_are_refused() {
+        let dir = std::env::temp_dir().join(format!("chatui-kdf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        Vault::create(&dir, "correct horse").unwrap();
+        let mut kf: KeyFile =
+            serde_json::from_slice(&fs::read(dir.join("key.json")).unwrap()).unwrap();
+        kf.m = u32::MAX;
+        fs::write(dir.join("key.json"), serde_json::to_vec(&kf).unwrap()).unwrap();
+        let start = Instant::now();
+        let e = Vault::unlock(&dir, "correct horse").err().unwrap();
+        assert!(e.contains("refusing"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(1));
         fs::remove_dir_all(dir).ok();
     }
 
