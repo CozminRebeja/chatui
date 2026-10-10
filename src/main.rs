@@ -155,14 +155,14 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 
 const USAGE: &str = "usage:
   chatui                 open the chat (first run asks for a username and server)
-  chatui serve [addr]    run a relay server (default [::]:7777)";
+  chatui serve [addr]    run a relay server (default [::]:6769)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let res = match args.as_slice() {
         ["serve"] => {
-            server::run("[::]:7777", &home().join("server.json"));
+            server::run("[::]:6769", &home().join("server.json"));
             Ok(())
         }
         ["serve", addr] => {

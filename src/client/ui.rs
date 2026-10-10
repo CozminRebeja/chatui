@@ -379,7 +379,7 @@ impl App {
         );
 
         f.render_widget(label("Server", s.focus == 1), s_label);
-        field(f, s_field, &s.server, s.focus == 1, "host:7777");
+        field(f, s_field, &s.server, s.focus == 1, "host:6769");
         f.render_widget(
             help(vec![
                 Line::from("The chatui server your group shares, written as host:port."),
@@ -394,7 +394,7 @@ impl App {
                 Line::from(vec![
                     "• Hosting it yourself? On an always-on machine run ".into(),
                     code("brew services start chatui"),
-                    " and use that machine's name with :7777.".into(),
+                    " and use that machine's name with :6769.".into(),
                 ]),
             ]),
             s_help,
@@ -854,7 +854,7 @@ impl App {
                     ]),
                     rows[2],
                 );
-                input_row(f, rows[4], "Server", server, true, "host:7777");
+                input_row(f, rows[4], "Server", server, true, "host:6769");
                 f.render_widget(
                     Line::from(
                         "Changing server keeps your key; your name is claimed on the new relay.",

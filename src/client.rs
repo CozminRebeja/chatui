@@ -277,7 +277,7 @@ impl App {
             return;
         }
         if server.is_empty() {
-            s.err = "enter the relay address, e.g. chat.example.com:7777".into();
+            s.err = "enter the relay address, e.g. chat.example.com:6769".into();
             return;
         }
         match handshake(&server, &user, &self.sk) {
