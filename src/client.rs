@@ -32,6 +32,9 @@ struct Store {
     verified: BTreeMap<String, Key>,
     /// Key pins from an invite code, waiting for that person's key to arrive.
     expect: BTreeMap<String, String>,
+    /// The first-run tour was shown (or closed) once; `/tutorial` shows it again.
+    #[serde(default)]
+    tutorial_seen: bool,
 }
 
 impl Store {
@@ -413,6 +416,13 @@ impl App {
         }
     }
 
+    /// Closes the tour and remembers it was shown, so it doesn't open again.
+    fn finish_tutorial(&mut self) {
+        self.popup = None;
+        self.store.tutorial_seen = true;
+        self.commit();
+    }
+
     fn notify(&mut self, msg: impl Into<String>, err: bool) {
         self.toast = Some((msg.into(), err, Instant::now()));
     }
@@ -530,6 +540,7 @@ impl App {
                 } else {
                     self.notify("You're in! Press v to invite your friends.", false);
                 }
+                self.popup = Some(Popup::Tutorial(0));
             }
         }
     }
@@ -2088,5 +2099,29 @@ mod tests {
         // ordinary text and emoji with joiners are untouched
         assert_eq!(clean("ăîșț 😀"), "ăîșț 😀");
         assert_eq!(clean("👨\u{200D}👩\u{200D}👧"), "👨\u{200D}👩\u{200D}👧");
+    }
+
+    #[test]
+    fn tutorial_opens_on_command_and_closes_once_seen() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        assert!(!alice.store.tutorial_seen);
+
+        alice.focus = Focus::Input;
+        for c in "/tutorial".chars() {
+            alice.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(0))));
+        assert!(alice.input.text.is_empty(), "/tutorial is not sent as a message");
+
+        alice.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Tutorial(1))), "Enter goes to the next step");
+
+        alice.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(alice.popup.is_none());
+        assert!(alice.store.tutorial_seen, "closing it counts as seen");
+        fs::remove_file(&state).ok();
     }
 }
