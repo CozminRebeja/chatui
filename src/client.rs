@@ -1445,6 +1445,22 @@ mod tests {
             a.store.expect.insert(login.inviter.clone(), pin);
         }
         a.attach(login);
+        // ready once the relay holds our prekeys, or someone writing to us right
+        // away could find none and be told we need to update
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < end,
+                "{me}: relay never confirmed our prekeys"
+            );
+            if let Ok(Ev::Pkt(p)) = rx.recv_timeout(Duration::from_millis(20)) {
+                let done = p.t == "prekeys";
+                a.on_pkt(p);
+                if done {
+                    break;
+                }
+            }
+        }
         (a, rx)
     }
 
