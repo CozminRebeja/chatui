@@ -91,13 +91,19 @@ pub fn handshake(
     user: &str,
     sk: &SecretKey,
 ) -> Result<(TcpStream, BufReader<TcpStream>), String> {
-    let addr = server
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or("bad server address")?;
-    let mut w =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| e.to_string())?;
+    // try every resolved address: .local names often resolve to IPv6 first
+    let mut last = "bad server address".to_string();
+    let mut conn = None;
+    for addr in server.to_socket_addrs().map_err(|e| e.to_string())? {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(s) => {
+                conn = Some(s);
+                break;
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    let mut w = conn.ok_or(last)?;
     let mut r = BufReader::new(w.try_clone().map_err(|e| e.to_string())?);
     let c = recv(&mut r).ok_or("no challenge")?;
     let (Some(srv), 32) = (c.key, c.data.len()) else {
@@ -149,14 +155,14 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 
 const USAGE: &str = "usage:
   chatui                 open the chat (first run asks for a username and server)
-  chatui serve [addr]    run a relay server (default 0.0.0.0:7777)";
+  chatui serve [addr]    run a relay server (default [::]:7777)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let res = match args.as_slice() {
         ["serve"] => {
-            server::run("0.0.0.0:7777", &home().join("server.json"));
+            server::run("[::]:7777", &home().join("server.json"));
             Ok(())
         }
         ["serve", addr] => {
