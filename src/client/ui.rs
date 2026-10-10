@@ -1848,6 +1848,27 @@ impl App {
                             );
                         }
                     }
+                } else if text == "/notify" || text.starts_with("/notify ") {
+                    self.input.take();
+                    match text["/notify".len()..].trim() {
+                        "off" => {
+                            self.store.no_alerts = true;
+                            self.commit();
+                            self.notify("desktop notifications off", false);
+                        }
+                        "on" => {
+                            self.store.no_alerts = false;
+                            self.commit();
+                            self.notify("desktop notifications on", false);
+                        }
+                        _ => {
+                            let state = if self.store.no_alerts { "off" } else { "on" };
+                            self.notify(
+                                format!("desktop notifications are {state} (/notify on or off)"),
+                                false,
+                            );
+                        }
+                    }
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
