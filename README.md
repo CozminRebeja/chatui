@@ -63,6 +63,28 @@ messages. If someone adds you to a group, you join it with `y` or decline with `
 | `t` or Ctrl-T | pick a theme: default, dracula, gruvbox, nord, solarized, synthwave, or your own |
 | `?` | everything else |
 
+Type these in the message box:
+
+| Command | |
+| --- | --- |
+| `/accept <name>` | accept a friend's new key, after comparing safety numbers (`i`) |
+| `/remove <name>` | group admin: take someone out of the open group |
+| `/grant <name>` / `/revoke <name>` | group admin: let a member remove people, or take that back |
+| `/leave` | leave the open group (the admin can't leave yet) |
+| `/receipts on` / `off` | show or hide read receipts |
+| `/notify on` / `off` | desktop notifications for new messages (Linux, through `notify-send`) |
+| `/tutorial` / `/help` | the first-run tour again / every key |
+
+Whoever makes a group is its admin. Only the admin, or a member the admin has
+granted, can `/remove` people; anyone can `/leave`. Everyone in a group needs
+0.9.8 or newer for these to work.
+
+## Back up your account
+
+`chatui backup <file>` saves your account to one encrypted file, and
+`chatui restore <file>` puts it back on a device (`--force` replaces the account
+already there). Chats are not included, and a backup still needs your passphrase.
+
 ## Themes, made by AI
 
 `chatui mcp` is an [MCP](https://modelcontextprotocol.io) server that lets an
