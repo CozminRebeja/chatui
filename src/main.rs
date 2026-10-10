@@ -148,9 +148,8 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 const USAGE: &str = "usage:
-  chatui init <username> <server:port>   create your identity (once)
-  chatui                                 open the chat
-  chatui serve [addr]                    run a relay server (default 0.0.0.0:7777)";
+  chatui                 open the chat (first run asks for a username and server)
+  chatui serve [addr]    run a relay server (default 0.0.0.0:7777)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -164,7 +163,6 @@ fn main() {
             server::run(addr, &home().join("server.json"));
             Ok(())
         }
-        ["init", user, srv] => client::init(user, srv),
         [] => client::run(),
         _ => Err(USAGE.into()),
     };

@@ -1,13 +1,15 @@
+mod ui;
+
 use crate::*;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+};
+use ratatui::crossterm::execute;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
+use ui::{Field, Focus, Popup, Rects};
 
 #[derive(Serialize, Deserialize)]
 struct Identity {
@@ -30,6 +32,24 @@ struct Chat {
     members: Vec<String>, // everyone except me
     group: bool,
     msgs: Vec<Msg>,
+    #[serde(default)]
+    created: DateTime<Utc>,
+}
+
+impl Chat {
+    fn new(id: String, name: String, members: Vec<String>, group: bool) -> Self {
+        Chat {
+            id,
+            name,
+            members,
+            group,
+            msgs: vec![],
+            created: Utc::now(),
+        }
+    }
+    fn last_activity(&self) -> DateTime<Utc> {
+        self.msgs.last().map_or(self.created, |m| m.ts)
+    }
 }
 
 /// Own messages: Pending -> Sent (server has it) -> Read (every member read it).
@@ -70,19 +90,35 @@ enum Ev {
     Down(u64),
 }
 
+/// First run: no identity yet, ask for a username and server.
+struct Setup {
+    user: Field,
+    server: Field,
+    focus: usize,
+    err: String,
+    busy: bool, // connect on the next tick, after "connecting…" is drawn
+}
+
 struct App {
     me: String,
     server: String,
     sk: SecretKey,
     store: Store,
-    path: PathBuf,
+    dir: PathBuf,
     sel: usize,
-    input: String,
-    status: String,
-    scroll: u16,
     conn: Option<TcpStream>,
     generation: u64,
     tx: Sender<Ev>,
+    // ui state
+    setup: Option<Setup>,
+    focus: Focus,
+    popup: Option<Popup>,
+    input: Field,
+    scroll: usize,
+    toast: Option<(String, bool, Instant)>,
+    list: ratatui::widgets::ListState,
+    rects: Rects,
+    quit: bool,
 }
 
 fn rand_id() -> String {
@@ -95,61 +131,61 @@ fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-pub fn init(user: &str, server: &str) -> Result<(), String> {
-    let path = home().join("identity.json");
-    if path.exists() {
-        return Err(format!(
-            "{} already exists; delete it to start over (you lose your name)",
-            path.display()
-        ));
-    }
-    if !valid_name(user) {
-        return Err("username: 1-20 chars of a-z 0-9 _ -".into());
-    }
-    let sk = SecretKey::generate(&mut OsRng);
-    let id = Identity {
-        user: user.into(),
-        server: server.into(),
-        secret: sk.to_bytes(),
-    };
-    write_private(&path, &serde_json::to_vec(&id).unwrap()).map_err(|e| e.to_string())?;
-    println!(
-        "identity created. your fingerprint: {}\nrun `chatui` to start",
-        fingerprint(&sk.public_key().to_bytes())
-    );
-    Ok(())
-}
-
 pub fn run() -> Result<(), String> {
     let dir = home();
-    let id: Identity = fs::read(dir.join("identity.json"))
-        .map_err(|_| format!("no identity yet\n{}", crate::USAGE))
-        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))?;
-    let path = dir.join("store.json");
-    let store = match fs::read(&path) {
-        Ok(b) => {
-            serde_json::from_slice(&b).map_err(|e| format!("{} is corrupt: {e}", path.display()))?
-        }
+    let store = match fs::read(dir.join("store.json")) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("store.json is corrupt: {e}"))?,
         Err(_) => Store::default(),
     };
+    let id: Option<Identity> = match fs::read(dir.join("identity.json")) {
+        Ok(b) => {
+            Some(serde_json::from_slice(&b).map_err(|e| format!("identity.json is corrupt: {e}"))?)
+        }
+        Err(_) => None,
+    };
     let (tx, rx) = mpsc::channel();
+    let setup = id.is_none().then(|| Setup {
+        user: Field::default(),
+        server: Field::from(option_env!("CHATUI_SERVER").unwrap_or("")),
+        focus: 0,
+        err: String::new(),
+        busy: false,
+    });
+    let (me, server, sk) = match id {
+        Some(i) => (i.user, i.server, SecretKey::from(i.secret)),
+        None => (
+            String::new(),
+            String::new(),
+            SecretKey::generate(&mut OsRng),
+        ),
+    };
     let mut app = App {
-        me: id.user,
-        server: id.server,
-        sk: SecretKey::from(id.secret),
+        me,
+        server,
+        sk,
         store,
-        path,
+        dir,
         sel: 0,
-        input: String::new(),
-        status: String::new(),
-        scroll: 0,
         conn: None,
         generation: 0,
         tx,
+        setup,
+        focus: Focus::Chats,
+        popup: None,
+        input: Field::default(),
+        scroll: 0,
+        toast: None,
+        list: Default::default(),
+        rects: Default::default(),
+        quit: false,
     };
-    app.connect();
+    if app.setup.is_none() {
+        app.connect();
+    }
     let mut term = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.run_loop(&mut term, rx);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -161,68 +197,142 @@ impl App {
         rx: Receiver<Ev>,
     ) -> Result<(), String> {
         let mut last_try = Instant::now();
-        loop {
+        while !self.quit {
             term.draw(|f| self.draw(f)).map_err(|e| e.to_string())?;
-            if event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())?
-                && let Event::Key(k) = event::read().map_err(|e| e.to_string())?
-                && k.kind == KeyEventKind::Press
-                && !self.key(k.code, k.modifiers)
-            {
-                return Ok(());
+            if self.setup.as_ref().is_some_and(|s| s.busy) {
+                self.finish_setup();
+            }
+            if event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+                match event::read().map_err(|e| e.to_string())? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
+                    Event::Mouse(m) => self.on_mouse(m),
+                    _ => {}
+                }
             }
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     Ev::Pkt(p) => self.on_pkt(p),
                     Ev::Down(g) if g == self.generation => {
                         self.conn = None;
-                        self.status = "disconnected, retrying…".into();
+                        self.notify("disconnected, retrying…", true);
                     }
                     Ev::Down(_) => {}
                 }
             }
-            if self.conn.is_none() && last_try.elapsed() > Duration::from_secs(3) {
+            if self.setup.is_none()
+                && self.conn.is_none()
+                && last_try.elapsed() > Duration::from_secs(3)
+            {
                 last_try = Instant::now();
                 self.connect();
             }
             self.mark_read();
         }
+        Ok(())
     }
 
-    fn save(&self) {
-        if let Err(e) = write_private(&self.path, &serde_json::to_vec(&self.store).unwrap()) {
+    fn notify(&mut self, msg: impl Into<String>, err: bool) {
+        self.toast = Some((msg.into(), err, Instant::now()));
+    }
+
+    /// Keep chats ordered by last activity (selection follows its chat), then persist.
+    fn commit(&mut self) {
+        let cur = self.store.chats.get(self.sel).map(|c| c.id.clone());
+        self.store
+            .chats
+            .sort_by_key(|c| std::cmp::Reverse(c.last_activity()));
+        if let Some(i) = cur.and_then(|id| self.find(&id)) {
+            self.sel = i;
+        }
+        if let Err(e) = write_private(
+            &self.dir.join("store.json"),
+            &serde_json::to_vec(&self.store).unwrap(),
+        ) {
             panic!("could not save chat history: {e}");
+        }
+    }
+
+    fn save_identity(&self) -> io::Result<()> {
+        let id = Identity {
+            user: self.me.clone(),
+            server: self.server.clone(),
+            secret: self.sk.to_bytes(),
+        };
+        write_private(
+            &self.dir.join("identity.json"),
+            &serde_json::to_vec(&id).unwrap(),
+        )
+    }
+
+    /// Setup screen: register on the server first, only save the identity once it accepted us.
+    fn finish_setup(&mut self) {
+        let Some(s) = &mut self.setup else { return };
+        s.busy = false;
+        let (user, server) = (
+            s.user.text.trim().to_string(),
+            s.server.text.trim().to_string(),
+        );
+        if !valid_name(&user) {
+            s.err = "username: 1-20 characters, a-z 0-9 _ -".into();
+            return;
+        }
+        if server.is_empty() {
+            s.err = "enter the relay address, e.g. chat.example.com:7777".into();
+            return;
+        }
+        match handshake(&server, &user, &self.sk) {
+            Err(e) => s.err = e,
+            Ok((w, r)) => {
+                (self.me, self.server) = (user, server);
+                if let Err(e) = self.save_identity() {
+                    if let Some(s) = &mut self.setup {
+                        s.err = format!("could not save identity: {e}");
+                    }
+                    return;
+                }
+                self.setup = None;
+                self.attach(w, r);
+            }
         }
     }
 
     fn connect(&mut self) {
         match handshake(&self.server, &self.me, &self.sk) {
-            Ok((w, mut r)) => {
-                self.generation += 1;
-                let (tx, g) = (self.tx.clone(), self.generation);
-                std::thread::spawn(move || {
-                    while let Some(p) = recv(&mut r) {
-                        if tx.send(Ev::Pkt(p)).is_err() {
-                            return;
-                        }
-                    }
-                    let _ = tx.send(Ev::Down(g));
-                });
-                self.conn = Some(w);
-                self.status = format!("connected to {}", self.server);
-                // resend whatever never reached the server; receivers drop duplicates by id
-                for ci in 0..self.store.chats.len() {
-                    let pending: Vec<Msg> = self.store.chats[ci]
-                        .msgs
-                        .iter()
-                        .filter(|m| m.from == self.me && m.status == Status::Pending)
-                        .cloned()
-                        .collect();
-                    for m in pending {
-                        self.deliver(ci, &m);
-                    }
+            Ok((w, r)) => self.attach(w, r),
+            Err(e) => self.notify(format!("offline ({e}), retrying…"), true),
+        }
+    }
+
+    fn reconnect(&mut self) {
+        self.generation += 1; // ignore the old reader's disconnect
+        self.conn = None;
+        self.connect();
+    }
+
+    fn attach(&mut self, w: TcpStream, mut r: BufReader<TcpStream>) {
+        self.generation += 1;
+        let (tx, g) = (self.tx.clone(), self.generation);
+        std::thread::spawn(move || {
+            while let Some(p) = recv(&mut r) {
+                if tx.send(Ev::Pkt(p)).is_err() {
+                    return;
                 }
             }
-            Err(e) => self.status = format!("offline ({e}), retrying…"),
+            let _ = tx.send(Ev::Down(g));
+        });
+        self.conn = Some(w);
+        self.notify(format!("connected to {}", self.server), false);
+        // resend whatever never reached the server; receivers drop duplicates by id
+        for ci in 0..self.store.chats.len() {
+            let pending: Vec<Msg> = self.store.chats[ci]
+                .msgs
+                .iter()
+                .filter(|m| m.from == self.me && m.status == Status::Pending)
+                .cloned()
+                .collect();
+            for m in pending {
+                self.deliver(ci, &m);
+            }
         }
     }
 
@@ -264,9 +374,27 @@ impl App {
         }
     }
 
+    fn send_text(&mut self, text: String) {
+        if self.sel >= self.store.chats.len() {
+            return self.notify("start a chat first (n)", true);
+        }
+        let m = Msg {
+            id: rand_id(),
+            from: self.me.clone(),
+            text,
+            ts: Utc::now(),
+            status: Status::Pending,
+            read_by: vec![],
+        };
+        self.store.chats[self.sel].msgs.push(m.clone());
+        self.deliver(self.sel, &m);
+        self.scroll = 0;
+        self.commit();
+    }
+
     /// Send read receipts for everything unread in the open chat.
     fn mark_read(&mut self) {
-        if self.conn.is_none() || self.sel >= self.store.chats.len() {
+        if self.conn.is_none() || self.setup.is_some() || self.sel >= self.store.chats.len() {
             return;
         }
         let c = &self.store.chats[self.sel];
@@ -302,7 +430,7 @@ impl App {
                 }
             }
         }
-        self.save();
+        self.commit();
     }
 
     fn find(&self, id: &str) -> Option<usize> {
@@ -314,6 +442,62 @@ impl App {
         self.store.chats.len() - 1
     }
 
+    fn select(&mut self, i: usize) {
+        if i < self.store.chats.len() && i != self.sel {
+            self.sel = i;
+            self.scroll = 0;
+        }
+    }
+
+    fn new_dm(&mut self, user: &str) -> Result<(), String> {
+        if user == self.me {
+            return Err("that's you".into());
+        }
+        if !valid_name(user) {
+            return Err("usernames are 1-20 characters: a-z 0-9 _ -".into());
+        }
+        if let Some(i) = self.find(user) {
+            self.select(i);
+            self.popup = None;
+            self.focus = Focus::Input;
+            return Ok(());
+        }
+        self.request_keys(vec![user.into()], String::new())
+    }
+
+    fn new_group(&mut self, name: &str, users: Vec<String>) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("give the group a name".into());
+        }
+        if users.len() < 2 {
+            return Err("pick at least 2 people (3+ with you)".into());
+        }
+        self.request_keys(users, clean(name.trim()))
+    }
+
+    /// Ask the server for public keys; the chat is created when they arrive (`on_keys`).
+    fn request_keys(&mut self, users: Vec<String>, group: String) -> Result<(), String> {
+        if self.write(&Pkt {
+            t: "keys".into(),
+            users,
+            group,
+            ..Default::default()
+        }) {
+            Ok(())
+        } else {
+            Err("offline — try again when connected".into())
+        }
+    }
+
+    fn delete_chat(&mut self) {
+        if self.sel < self.store.chats.len() {
+            self.store.chats.remove(self.sel);
+            self.sel = self.sel.min(self.store.chats.len().saturating_sub(1));
+            self.scroll = 0;
+            self.commit();
+        }
+    }
+
     fn on_pkt(&mut self, p: Pkt) {
         match p.t.as_str() {
             "ack" => {
@@ -322,9 +506,9 @@ impl App {
                         m.status = Status::Sent;
                     }
                 }
-                self.save();
+                self.commit();
             }
-            "err" => self.status = format!("server: {}", p.err),
+            "err" => self.notify(format!("server: {}", p.err), true),
             "keys" => self.on_keys(p),
             "msg" => self.on_msg(p),
             _ => {}
@@ -339,28 +523,23 @@ impl App {
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
-            self.status = format!("no such user: {}", missing.join(", "));
-            return;
+            return self.popup_error(format!("no such user: {}", missing.join(", ")));
         }
-        for (u, k) in &p.keys {
-            if self.store.contacts.get(u).is_some_and(|old| old != k) {
-                self.status =
-                    format!("⚠ server returned a different key for {u} than before — refusing");
-                return;
-            }
+        if let Some(u) = p
+            .keys
+            .iter()
+            .find(|(u, k)| self.store.contacts.get(*u).is_some_and(|old| old != *k))
+            .map(|(u, _)| u)
+        {
+            return self.popup_error(format!(
+                "⚠ server returned a different key for {u} than before — refusing"
+            ));
         }
         self.store.contacts.extend(p.keys.clone());
-        if p.group.is_empty() {
+        let ci = if p.group.is_empty() {
             let u = p.users[0].clone();
-            self.sel = self.find(&u).unwrap_or_else(|| {
-                self.add_chat(Chat {
-                    id: u.clone(),
-                    name: u,
-                    members: p.users,
-                    group: false,
-                    msgs: vec![],
-                })
-            });
+            self.find(&u)
+                .unwrap_or_else(|| self.add_chat(Chat::new(u.clone(), u, p.users, false)))
         } else {
             let id = format!("g{}", rand_id());
             let mut members = p.keys.clone();
@@ -375,15 +554,20 @@ impl App {
             for u in &p.users {
                 self.send_to(u, "", &invite);
             }
-            self.sel = self.add_chat(Chat {
-                id,
-                name: p.group,
-                members: p.users,
-                group: true,
-                msgs: vec![],
-            });
+            self.add_chat(Chat::new(id, p.group, p.users, true))
+        };
+        self.sel = ci;
+        self.scroll = 0;
+        self.popup = None;
+        self.focus = Focus::Input;
+        self.commit();
+    }
+
+    fn popup_error(&mut self, e: String) {
+        match &mut self.popup {
+            Some(Popup::NewChat { err, .. } | Popup::NewGroup { err, .. }) => *err = e,
+            _ => self.notify(e, true),
         }
-        self.save();
     }
 
     fn on_msg(&mut self, p: Pkt) {
@@ -394,9 +578,10 @@ impl App {
             return;
         }
         if self.store.contacts.get(&from).is_some_and(|k| *k != key) {
-            self.status =
-                format!("⚠ message claiming to be from {from} had a different key — dropped");
-            return;
+            return self.notify(
+                format!("⚠ message claiming to be from {from} had a different key — dropped"),
+                true,
+            );
         }
         let Some(m) =
             open(&key, &self.sk, &p.data).and_then(|b| serde_json::from_slice::<Payload>(&b).ok())
@@ -413,13 +598,12 @@ impl App {
             "msg" => {
                 let ci = match self.find(&chat_id) {
                     Some(i) => i,
-                    None if m.chat.is_empty() => self.add_chat(Chat {
-                        id: from.clone(),
-                        name: from.clone(),
-                        members: vec![from.clone()],
-                        group: false,
-                        msgs: vec![],
-                    }),
+                    None if m.chat.is_empty() => self.add_chat(Chat::new(
+                        from.clone(),
+                        from.clone(),
+                        vec![from.clone()],
+                        false,
+                    )),
                     None => return, // group we were never invited to
                 };
                 let c = &mut self.store.chats[ci];
@@ -434,6 +618,8 @@ impl App {
                     status: Status::Pending,
                     read_by: vec![],
                 });
+                // keep the timeline ordered even if a resend arrives late
+                c.msgs.sort_by_key(|x| x.ts);
             }
             "read" => {
                 let Some(ci) = self.find(&chat_id) else {
@@ -458,10 +644,8 @@ impl App {
                 if self.find(&m.chat).is_some()
                     || !m.chat.starts_with('g')
                     || !m.members.contains_key(&self.me)
+                    || !m.members.keys().all(|u| valid_name(u))
                 {
-                    return;
-                }
-                if !m.members.keys().all(|u| valid_name(u)) {
                     return;
                 }
                 for (u, k) in &m.members {
@@ -476,220 +660,11 @@ impl App {
                     .filter(|u| **u != self.me)
                     .cloned()
                     .collect();
-                self.add_chat(Chat {
-                    id: m.chat,
-                    name: clean(&m.name),
-                    members,
-                    group: true,
-                    msgs: vec![],
-                });
+                self.add_chat(Chat::new(m.chat, clean(&m.name), members, true));
+                self.notify(format!("{from} added you to a group"), false);
             }
             _ => return,
         }
-        self.save();
-    }
-
-    fn command(&mut self, line: &str) {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        match words.as_slice() {
-            ["/dm", u] if *u == self.me => self.status = "that's you".into(),
-            ["/dm", u] if valid_name(u) => match self.find(u) {
-                Some(i) => self.sel = i,
-                None => {
-                    self.write(&Pkt {
-                        t: "keys".into(),
-                        users: vec![u.to_string()],
-                        ..Default::default()
-                    });
-                }
-            },
-            ["/group", name, users @ ..] => {
-                let mut users: Vec<String> = users
-                    .iter()
-                    .map(|s| s.to_string())
-                    .filter(|u| *u != self.me)
-                    .collect();
-                users.sort();
-                users.dedup();
-                if users.len() < 2 || !users.iter().all(|u| valid_name(u)) {
-                    self.status = "a group needs at least 2 other valid usernames".into();
-                } else if !self.write(&Pkt {
-                    t: "keys".into(),
-                    users,
-                    group: name.to_string(),
-                    ..Default::default()
-                }) {
-                    self.status = "offline — can't create a group right now".into();
-                }
-            }
-            ["/close"] if self.sel < self.store.chats.len() => {
-                self.store.chats.remove(self.sel);
-                self.sel = self.sel.saturating_sub(1);
-                self.save();
-            }
-            _ => self.status = "commands: /dm <user>  /group <name> <user> <user>…  /close".into(),
-        }
-    }
-
-    /// Returns false to quit.
-    fn key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        let n = self.store.chats.len().max(1);
-        match code {
-            KeyCode::Esc => return false,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
-            KeyCode::Tab => (self.sel, self.scroll) = ((self.sel + 1) % n, 0),
-            KeyCode::BackTab => (self.sel, self.scroll) = ((self.sel + n - 1) % n, 0),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(ch) => self.input.push(ch),
-            KeyCode::Enter => {
-                let text = std::mem::take(&mut self.input).trim().to_string();
-                if text.starts_with('/') {
-                    self.command(&text);
-                } else if !text.is_empty() && self.sel < self.store.chats.len() {
-                    let m = Msg {
-                        id: rand_id(),
-                        from: self.me.clone(),
-                        text,
-                        ts: Utc::now(),
-                        status: Status::Pending,
-                        read_by: vec![],
-                    };
-                    self.store.chats[self.sel].msgs.push(m.clone());
-                    self.deliver(self.sel, &m);
-                    self.save();
-                    self.scroll = 0;
-                } else if !text.is_empty() {
-                    self.status = "open a chat first: /dm <user>".into();
-                }
-            }
-            _ => {}
-        }
-        true
-    }
-
-    fn draw(&self, f: &mut ratatui::Frame) {
-        let [top, input, status] = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        let [side, main] =
-            Layout::horizontal([Constraint::Length(24), Constraint::Min(10)]).areas(top);
-
-        let items: Vec<ListItem> = self
-            .store
-            .chats
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let unread = c
-                    .msgs
-                    .iter()
-                    .filter(|m| m.from != self.me && m.status == Status::Pending)
-                    .count();
-                let mut s = format!("{}{}", if c.group { "# " } else { "@ " }, c.name);
-                if unread > 0 {
-                    s += &format!(" ({unread})");
-                }
-                let style = if i == self.sel {
-                    Style::new().reversed()
-                } else if unread > 0 {
-                    Style::new().bold()
-                } else {
-                    Style::new()
-                };
-                ListItem::new(s).style(style)
-            })
-            .collect();
-        f.render_widget(
-            List::new(items).block(Block::bordered().title(format!(" {} ", self.me))),
-            side,
-        );
-
-        let Some(c) = self.store.chats.get(self.sel) else {
-            let help = "No chats yet.\n\n/dm <user>                    start a chat\n/group <name> <u1> <u2> …     start a group\n/close                        remove a chat\nTab / Shift-Tab               switch chat\nPgUp / PgDn                   scroll\nEsc                           quit";
-            f.render_widget(Paragraph::new(help).block(Block::bordered()), main);
-            return self.draw_bottom(f, input, status);
-        };
-        let title = if c.group {
-            format!(" # {} — {}, you ", c.name, c.members.join(", "))
-        } else {
-            let fp = self
-                .store
-                .contacts
-                .get(&c.id)
-                .map(fingerprint)
-                .unwrap_or_default();
-            format!(" @ {} — key {fp} ", c.name)
-        };
-        let today = Local::now().date_naive();
-        let lines: Vec<Line> = c
-            .msgs
-            .iter()
-            .map(|m| {
-                let ts = m.ts.with_timezone(&Local);
-                let ts = if ts.date_naive() == today {
-                    ts.format("%H:%M")
-                } else {
-                    ts.format("%b %d %H:%M")
-                };
-                let mine = m.from == self.me;
-                let mut spans = vec![
-                    Span::styled(format!("{ts} "), Style::new().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{}: ", m.from),
-                        Style::new()
-                            .fg(if mine { Color::Green } else { Color::Cyan })
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(m.text.clone()),
-                ];
-                if mine {
-                    spans.push(match m.status {
-                        Status::Pending => Span::styled(" ⏳", Style::new().fg(Color::DarkGray)),
-                        Status::Sent => Span::styled(" ✓ sent", Style::new().fg(Color::DarkGray)),
-                        Status::Read => Span::styled(" ✓✓ read", Style::new().fg(Color::Blue)),
-                    });
-                }
-                Line::from(spans)
-            })
-            .collect();
-        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let h = main.height.saturating_sub(2) as usize;
-        let total = p.line_count(main.width.saturating_sub(2));
-        let y = total.saturating_sub(h).saturating_sub(self.scroll as usize);
-        f.render_widget(
-            p.scroll((y as u16, 0))
-                .block(Block::bordered().title(title)),
-            main,
-        );
-        self.draw_bottom(f, input, status);
-    }
-
-    fn draw_bottom(
-        &self,
-        f: &mut ratatui::Frame,
-        input: ratatui::layout::Rect,
-        status: ratatui::layout::Rect,
-    ) {
-        f.render_widget(
-            Paragraph::new(format!("{}█", self.input))
-                .block(Block::bordered().title(" message or /command ")),
-            input,
-        );
-        let online = if self.conn.is_some() {
-            "●".green()
-        } else {
-            "●".red()
-        };
-        f.render_widget(
-            Line::from(vec![online, " ".into(), self.status.clone().dark_gray()]),
-            status,
-        );
+        self.commit();
     }
 }
