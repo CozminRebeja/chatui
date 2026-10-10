@@ -198,6 +198,16 @@ pub fn handshake(
     let (mut ws, _) =
         tungstenite::client_tls_with_config(url.as_str(), tcp, Some(ws_config()), None)
             .map_err(|e| e.to_string())?;
+    // client speaks first: Cloudflare's tunnel drops what the server sends before that
+    if !send(
+        &mut ws,
+        &Pkt {
+            t: "hello".into(),
+            ..Default::default()
+        },
+    ) {
+        return Err("connection closed".into());
+    }
     let c = recv(&mut ws).ok_or("no challenge")?;
     let (Some(srv), 32) = (c.key, c.data.len()) else {
         return Err("bad challenge".into());

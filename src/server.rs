@@ -92,6 +92,9 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey) -> Optio
     c.set_read_timeout(Some(Duration::from_secs(10))).ok(); // login must not hang
     let ctl = c.try_clone().ok()?;
     let mut ws = tungstenite::accept_with_config(c, Some(ws_config())).ok()?;
+    if recv(&mut ws)?.t != "hello" {
+        return None;
+    }
 
     let mut challenge = vec![0u8; 32];
     OsRng.fill_bytes(&mut challenge);
