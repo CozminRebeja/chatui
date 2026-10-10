@@ -1,6 +1,7 @@
 mod backup;
 mod client;
 mod mcp;
+mod reflector;
 mod server;
 mod theme;
 mod vault;
@@ -46,6 +47,8 @@ pub struct Pkt {
     /// One-time prekeys we publish, and how many the relay still holds for us.
     pub otks: Vec<Key>,
     pub count: usize,
+    /// Where the relay takes call packets over UDP ("host:port", or ":port" on its own host).
+    pub udp: String,
 }
 
 /// Prefix for the login proof, so a malicious server can't trick a client into
@@ -193,6 +196,10 @@ pub fn open(from: &Key, sk: &SecretKey, data: &[u8]) -> Option<Vec<u8>> {
     SalsaBox::new(&PublicKey::from(*from), sk)
         .decrypt(GenericArray::from_slice(n), ct)
         .ok()
+}
+
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 pub fn valid_name(s: &str) -> bool {
@@ -375,6 +382,8 @@ const USAGE: &str = "usage:
   chatui                         open the chat (first run asks for a username and server)
   chatui serve [addr]            run a relay server (default [::]:6769)
   chatui serve [addr] --admin U  ...and make user U its admin (can remove people)
+  chatui serve [addr] --udp H:P  ...where clients reach its UDP port for calls,
+                                 if not the same host (e.g. behind a Cloudflare Tunnel)
   chatui serve --invite          print an invite code (with the relay stopped)
   chatui serve --release U       free username U to sign up again, e.g. after a
                                  forgotten passphrase (with the relay stopped)
@@ -384,24 +393,33 @@ const USAGE: &str = "usage:
   chatui restore <file>          put a saved account back [--force to replace]
   chatui --version               print the version";
 
+/// `chatui serve ...`
+fn serve(args: &[&str]) -> Result<(), String> {
+    let path = home().join("server.json");
+    let say = |m: String| println!("{m}");
+    match args {
+        ["--invite"] => return server::invite_cmd(&path).map(say),
+        ["--release", u] => return server::release_cmd(&path, u).map(say),
+        _ => {}
+    }
+    let (mut addr, mut admin, mut udp) = (None, None, "");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--admin" => admin = Some(*it.next().ok_or(USAGE)?),
+            "--udp" => udp = it.next().filter(|u| u.contains(':')).ok_or(USAGE)?,
+            a if addr.is_none() && !a.starts_with('-') => addr = Some(a),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    server::run(addr.unwrap_or("[::]:6769"), &path, admin, udp)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let say = |m: String| println!("{m}");
-    let serve = |addr: Option<&str>, admin| {
-        server::run(
-            addr.unwrap_or("[::]:6769"),
-            &home().join("server.json"),
-            admin,
-        )
-    };
     let res = match args.as_slice() {
-        ["serve"] => serve(None, None),
-        ["serve", "--admin", u] => serve(None, Some(*u)),
-        ["serve", "--invite"] => server::invite_cmd(&home().join("server.json")).map(say),
-        ["serve", "--release", u] => server::release_cmd(&home().join("server.json"), u).map(say),
-        ["serve", addr] => serve(Some(*addr), None),
-        ["serve", addr, "--admin", u] => serve(Some(*addr), Some(*u)),
+        ["serve", rest @ ..] => serve(rest),
         ["--version"] | ["-V"] => Ok(println!("chatui {}", env!("CARGO_PKG_VERSION"))),
         ["mcp"] => mcp::run(),
         ["backup", file] => backup::backup(&home(), Path::new(file))
@@ -650,7 +668,7 @@ mod tests {
             "joined": {"bob": old},
         });
         fs::write(&state, seed.to_string()).unwrap();
-        assert!(server::run("127.0.0.1:0", &state, Some("nobody")).is_err());
+        assert!(server::run("127.0.0.1:0", &state, Some("nobody"), "").is_err());
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let st = state.clone();
@@ -690,7 +708,7 @@ mod tests {
         let addr2 = l.local_addr().unwrap().to_string();
         let st = state.clone();
         std::thread::spawn(move || {
-            server::run("x", &st, Some("alice")).unwrap_err(); // sets admin, then fails to bind
+            server::run("x", &st, Some("alice"), "").unwrap_err(); // sets admin, then fails to bind
             server::serve(l, &st)
         });
         std::thread::sleep(Duration::from_millis(300));
@@ -757,7 +775,7 @@ mod tests {
         fs::write(&state, seed.to_string()).unwrap();
 
         // a running relay holds the lock
-        let running = server::run("x", &state, None);
+        let running = server::run("x", &state, None, "");
         assert!(running.unwrap_err().contains("bind")); // it got the lock, then failed to bind
         let held = {
             let f = OpenOptions::new()

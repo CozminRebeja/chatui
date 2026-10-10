@@ -87,23 +87,26 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+          # the oldest Ubuntu runners: built against an older glibc, the
+          # .deb runs on Debian 12 / Ubuntu 22.04 and anything newer
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.version.outputs.ref }}
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # calls need ALSA for the microphone and speakers, so the .deb links it
+      # dynamically and depends on libasound2 (worked out by cargo-deb)
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev cmake
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
       - run: cargo install cargo-deb --locked --version 3.8.0
-      # static musl binary, so one .deb runs on any Debian/Ubuntu release
       - run: cargo deb --locked --target ${{ matrix.target }} --output dist/
         env:
           # prefilled on the first-run screen, same as the Homebrew formula
