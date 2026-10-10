@@ -1,4 +1,5 @@
 use super::*;
+use crate::theme::{self, th};
 use chrono::Local;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -12,19 +13,6 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use unicode_width::UnicodeWidthChar;
-
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-const SELECTED_BG: Color = Color::Indexed(236);
-const FIELD_BG: Color = Color::Indexed(235);
-const NAME_COLORS: [Color; 6] = [
-    Color::Magenta,
-    Color::Yellow,
-    Color::LightBlue,
-    Color::LightRed,
-    Color::Green,
-    Color::LightMagenta,
-];
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Focus {
@@ -44,13 +32,20 @@ pub enum Popup {
         user: Field,
         err: String,
     },
+    /// New group, or with `group` set, adding people to that existing group.
     NewGroup {
+        group: Option<String>,
         name: Field,
         add: Field,
         picks: Vec<(String, bool)>,
         cursor: usize,
         focus: usize,
         err: String,
+    },
+    /// Moving the cursor previews the theme live; Esc goes back to the active one.
+    Themes {
+        names: Vec<String>,
+        cursor: usize,
     },
 }
 
@@ -156,7 +151,7 @@ impl Field {
             start += 1;
         }
         if self.text.is_empty() {
-            f.render_widget(Paragraph::new(placeholder.fg(DIM)), area);
+            f.render_widget(Paragraph::new(placeholder.fg(th().dim)), area);
         } else {
             f.render_widget(
                 Paragraph::new(chars[start..].iter().collect::<String>()),
@@ -173,17 +168,24 @@ impl Field {
     }
 }
 
+/// The theme's text and background, for anything drawn over `Clear`.
+fn base() -> Style {
+    Style::new().fg(th().text).bg(th().bg)
+}
+
 fn pane<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
     Block::bordered()
+        .style(base())
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if focused { ACCENT } else { DIM }))
+        .border_style(Style::new().fg(if focused { th().accent } else { th().dim }))
         .title(title)
 }
 
 fn popup_block<'a>(title: &'a str, hints: &[(&'a str, &'a str)]) -> Block<'a> {
     Block::bordered()
+        .style(base())
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(th().accent))
         .title(Line::from(format!(" {title} ")).bold())
         .title_bottom(hint_line(hints))
 }
@@ -191,8 +193,8 @@ fn popup_block<'a>(title: &'a str, hints: &[(&'a str, &'a str)]) -> Block<'a> {
 fn hint_line<'a>(hints: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut spans = vec![Span::raw(" ")];
     for (k, d) in hints {
-        spans.push(Span::styled(*k, Style::new().fg(ACCENT).bold()));
-        spans.push(Span::styled(format!(" {d}  "), Style::new().fg(DIM)));
+        spans.push(Span::styled(*k, Style::new().fg(th().accent).bold()));
+        spans.push(Span::styled(format!(" {d}  "), Style::new().fg(th().dim)));
     }
     Line::from(spans)
 }
@@ -218,20 +220,20 @@ fn input_row(
 ) {
     let [l, r] = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)]).areas(area);
     let style = if focused {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(th().accent).bold()
     } else {
-        Style::new().fg(Color::Gray)
+        Style::new().fg(th().muted)
     };
     f.render_widget(Paragraph::new(label).style(style), l);
-    f.render_widget(Block::new().style(Style::new().bg(FIELD_BG)), r);
+    f.render_widget(Block::new().style(Style::new().bg(th().field_bg)), r);
     field.render(f, r.inner(Margin::new(1, 0)), focused, placeholder);
 }
 
 fn name_color(name: &str) -> Color {
-    NAME_COLORS[name
+    th().names[name
         .bytes()
         .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize))
-        % NAME_COLORS.len()]
+        % 6]
 }
 
 fn short_time(ts: DateTime<Utc>) -> String {
@@ -273,6 +275,7 @@ impl App {
     }
 
     pub(super) fn draw(&mut self, f: &mut Frame) {
+        f.render_widget(Block::new().style(base()), f.area());
         if self.setup.is_some() {
             return self.draw_setup(f);
         }
@@ -296,6 +299,7 @@ impl App {
         self.draw_chats(f, side);
         self.draw_messages(f, msgs);
         self.draw_input(f, input);
+        self.draw_mentions(f, input);
         self.draw_footer(f, footer);
         if self.popup.is_some() {
             self.draw_popup(f);
@@ -343,27 +347,27 @@ impl App {
         .areas(inner);
         let help = |text: Vec<Line<'static>>| {
             Paragraph::new(text)
-                .fg(Color::Gray)
+                .fg(th().muted)
                 .wrap(Wrap { trim: true })
         };
         let label = |name: &'static str, on: bool| {
             Line::from(name).style(if on {
-                Style::new().fg(ACCENT).bold()
+                Style::new().fg(th().accent).bold()
             } else {
                 Style::new().bold()
             })
         };
         let field = |f: &mut Frame, area: Rect, field: &Field, on: bool, placeholder: &str| {
-            f.render_widget(Block::new().style(Style::new().bg(FIELD_BG)), area);
+            f.render_widget(Block::new().style(Style::new().bg(th().field_bg)), area);
             field.render(f, area.inner(Margin::new(1, 0)), on, placeholder);
         };
-        let code = |s: &'static str| Span::styled(s, Style::new().fg(ACCENT));
+        let code = |s: &'static str| Span::styled(s, Style::new().fg(th().accent));
 
         f.render_widget(
             Paragraph::new(vec![
                 Line::from("Set up once. After this, just run chatui and talk to your friends.")
                     .bold(),
-                Line::from("Messages are end-to-end encrypted.").fg(DIM),
+                Line::from("Messages are end-to-end encrypted.").fg(th().dim),
             ]),
             intro,
         );
@@ -402,16 +406,16 @@ impl App {
 
         f.render_widget(
             Paragraph::new("🔒 Your keys are created on this device and never leave it. The server only passes along encrypted messages.")
-                .fg(DIM)
+                .fg(th().dim)
                 .wrap(Wrap { trim: true }),
             note,
         );
         let err = Paragraph::new(s.err.as_str()).wrap(Wrap { trim: true });
         f.render_widget(
             if s.busy {
-                err.fg(Color::Yellow)
+                err.fg(th().warn)
             } else {
-                err.fg(Color::LightRed)
+                err.fg(th().error)
             },
             status,
         );
@@ -419,22 +423,22 @@ impl App {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let status = if self.conn.is_some() {
-            "● online".fg(Color::Green)
+            "● online".fg(th().ok)
         } else {
-            "● offline".fg(Color::LightRed)
+            "● offline".fg(th().error)
         };
         let left = Line::from(vec![
-            " chatui ".bold().fg(Color::Black).bg(ACCENT),
+            " chatui ".bold().fg(th().on_accent).bg(th().accent),
             "  ".into(),
             self.me.clone().bold(),
             "  ".into(),
             status,
             "  ".into(),
-            self.server.clone().fg(DIM),
+            self.server.clone().fg(th().dim),
         ]);
         f.render_widget(left, area);
         f.render_widget(
-            Line::from(vec!["?".fg(ACCENT).bold(), " help ".fg(DIM)]).right_aligned(),
+            Line::from(vec!["?".fg(th().accent).bold(), " help ".fg(th().dim)]).right_aligned(),
             area,
         );
     }
@@ -447,10 +451,14 @@ impl App {
         if self.store.chats.is_empty() {
             let text = vec![
                 Line::default(),
-                Line::from("No friends yet").fg(DIM).centered(),
+                Line::from("No friends yet").fg(th().dim).centered(),
                 Line::default(),
-                Line::from(vec!["f".fg(ACCENT).bold(), "  add a friend".fg(DIM)]).centered(),
-                Line::from(vec!["g".fg(ACCENT).bold(), "  new group".fg(DIM)]).centered(),
+                Line::from(vec![
+                    "f".fg(th().accent).bold(),
+                    "  add a friend".fg(th().dim),
+                ])
+                .centered(),
+                Line::from(vec!["g".fg(th().accent).bold(), "  new group".fg(th().dim)]).centered(),
             ];
             return f.render_widget(Paragraph::new(text).block(block), area);
         }
@@ -463,25 +471,39 @@ impl App {
                 let unread = self.unread(c);
                 let time = c.msgs.last().map(|m| short_time(m.ts)).unwrap_or_default();
                 let name_style = if unread > 0 {
-                    Style::new().bold().fg(Color::White)
+                    Style::new().bold().fg(th().bright)
                 } else {
                     Style::new()
                 };
                 let icon = if c.group { "# " } else { "@ " };
                 let name = truncate(&c.name, w.saturating_sub(time.len() + 3));
                 let top = spread(
-                    vec![icon.fg(ACCENT), Span::styled(name, name_style)],
-                    time.fg(DIM),
+                    vec![icon.fg(th().accent), Span::styled(name, name_style)],
+                    time.fg(th().dim),
                     w,
                 );
                 let preview = match c.msgs.last() {
+                    Some(m) if m.from.is_empty() => m.text.clone(),
                     Some(m) if m.from == self.me => format!("you: {}", m.text),
                     Some(m) if c.group => format!("{}: {}", m.from, m.text),
                     Some(m) => m.text.clone(),
                     None => "no messages yet".into(),
                 };
-                let badge = if unread > 0 {
-                    format!(" {unread} ").bold().fg(Color::Black).bg(ACCENT)
+                let pinged = c.msgs.iter().any(|m| {
+                    m.from != self.me
+                        && m.status == Status::Pending
+                        && mentions_user(&m.text, &self.me)
+                });
+                let badge = if pinged {
+                    format!(" @{unread} ")
+                        .bold()
+                        .fg(th().on_accent)
+                        .bg(th().mention)
+                } else if unread > 0 {
+                    format!(" {unread} ")
+                        .bold()
+                        .fg(th().on_accent)
+                        .bg(th().accent)
                 } else {
                     Span::raw("")
                 };
@@ -489,7 +511,7 @@ impl App {
                 let bottom = spread(
                     vec![
                         "  ".into(),
-                        preview.fg(if unread > 0 { Color::Gray } else { DIM }),
+                        preview.fg(if unread > 0 { th().muted } else { th().dim }),
                     ],
                     badge,
                     w,
@@ -500,9 +522,30 @@ impl App {
         self.list.select(Some(self.sel));
         let list = List::new(items)
             .block(block)
-            .highlight_style(Style::new().bg(SELECTED_BG))
+            .highlight_style(Style::new().bg(th().selected_bg))
             .highlight_symbol("▌ ");
         f.render_stateful_widget(list, area, &mut self.list);
+    }
+
+    /// Message text with `@name` highlighted for people in the chat; `@you` stands out.
+    fn text_spans(&self, c: &Chat, text: &str) -> Vec<Span<'static>> {
+        let mut out = vec![];
+        let mut at = 0;
+        for (a, b) in mentions(text) {
+            let who = &text[a + 1..b];
+            let style = if who == self.me {
+                Style::new().fg(th().on_accent).bg(th().mention).bold()
+            } else if c.members.iter().any(|u| u == who) {
+                Style::new().fg(name_color(who)).bold()
+            } else {
+                continue;
+            };
+            out.push(Span::raw(text[at..a].to_string()));
+            out.push(Span::styled(text[a..b].to_string(), style));
+            at = b;
+        }
+        out.push(Span::raw(text[at..].to_string()));
+        out
     }
 
     fn message_lines(&self, c: &Chat) -> Vec<Line<'static>> {
@@ -518,9 +561,15 @@ impl App {
                 }
                 out.push(
                     Line::from(format!("── {} ──", day_label(local)))
-                        .fg(DIM)
+                        .fg(th().dim)
                         .centered(),
                 );
+            }
+            if m.from.is_empty() {
+                out.push(Line::default());
+                out.push(Line::from(m.text.clone()).fg(th().dim).italic().centered());
+                prev = Some(m);
+                continue;
             }
             let mine = m.from == self.me;
             if new_day
@@ -536,25 +585,27 @@ impl App {
                 let line = Line::from(Span::styled(
                     name,
                     Style::new()
-                        .fg(if mine { ACCENT } else { name_color(&m.from) })
+                        .fg(if mine {
+                            th().accent
+                        } else {
+                            name_color(&m.from)
+                        })
                         .bold(),
                 ));
                 out.push(if mine { line.right_aligned() } else { line });
             }
-            let mut spans = vec![
-                Span::raw(m.text.clone()),
-                Span::raw("  "),
-                local.format("%H:%M").to_string().fg(DIM),
-            ];
+            let mut spans = self.text_spans(c, &m.text);
+            spans.push(Span::raw("  "));
+            spans.push(local.format("%H:%M").to_string().fg(th().dim));
             if mine {
                 let n = c.members.len();
                 spans.push(match m.status {
-                    Status::Pending => " ◷".fg(DIM),
+                    Status::Pending => " ◷".fg(th().dim),
                     Status::Sent if c.group && !m.read_by.is_empty() => {
-                        format!(" ✓ {}/{n} read", m.read_by.len()).fg(Color::Gray)
+                        format!(" ✓ {}/{n} read", m.read_by.len()).fg(th().muted)
                     }
-                    Status::Sent => " ✓ sent".fg(Color::Gray),
-                    Status::Read => " ✓✓ read".fg(ACCENT),
+                    Status::Sent => " ✓ sent".fg(th().muted),
+                    Status::Read => " ✓✓ read".fg(th().accent),
                 });
             }
             let line = Line::from(spans);
@@ -572,14 +623,14 @@ impl App {
                 Line::from("Welcome to chatui").bold().centered(),
                 Line::default(),
                 Line::from("Messages are end-to-end encrypted.")
-                    .fg(DIM)
+                    .fg(th().dim)
                     .centered(),
                 Line::from(vec![
-                    "Press ".fg(DIM),
-                    "f".fg(ACCENT).bold(),
-                    " to add a friend by username, ".fg(DIM),
-                    "g".fg(ACCENT).bold(),
-                    " for a group.".fg(DIM),
+                    "Press ".fg(th().dim),
+                    "f".fg(th().accent).bold(),
+                    " to add a friend by username, ".fg(th().dim),
+                    "g".fg(th().accent).bold(),
+                    " for a group.".fg(th().dim),
                 ])
                 .centered(),
             ];
@@ -587,15 +638,15 @@ impl App {
         };
         let title = if c.group {
             Line::from(vec![
-                " # ".fg(ACCENT),
+                " # ".fg(th().accent),
                 c.name.clone().bold(),
-                format!(" · {} people ", c.members.len() + 1).fg(DIM),
+                format!(" · {} people ", c.members.len() + 1).fg(th().dim),
             ])
         } else {
             Line::from(vec![
-                " @ ".fg(ACCENT),
+                " @ ".fg(th().accent),
                 c.name.clone().bold(),
-                " · press i to verify keys ".fg(DIM),
+                " · press i to verify keys ".fg(th().dim),
             ])
         };
         let block = pane(title, focused);
@@ -604,7 +655,9 @@ impl App {
         if c.msgs.is_empty() {
             let hi = Paragraph::new(vec![
                 Line::default(),
-                Line::from("No messages yet — say hi").fg(DIM).centered(),
+                Line::from("No messages yet — say hi")
+                    .fg(th().dim)
+                    .centered(),
             ]);
             return f.render_widget(hi, inner);
         }
@@ -625,7 +678,7 @@ impl App {
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
-                .thumb_style(Style::new().fg(DIM));
+                .thumb_style(Style::new().fg(th().dim));
             f.render_stateful_widget(bar, area.inner(Margin::new(0, 1)), &mut sb);
         }
     }
@@ -647,11 +700,91 @@ impl App {
         self.input.render(f, inner, focused, placeholder);
     }
 
+    /// While typing `@pre` just before the cursor: the char index of the @ and
+    /// the chat's members starting with `pre` (case-insensitive).
+    pub(super) fn mention_query(&self) -> Option<(usize, Vec<String>)> {
+        let c = self.store.chats.get(self.sel)?;
+        let chars: Vec<char> = self.input.text.chars().collect();
+        let before = &chars[..self.input.cur];
+        let at = before.iter().rposition(|&ch| ch == '@')?;
+        if at > 0 && !before[at - 1].is_whitespace() {
+            return None;
+        }
+        let pre: String = before[at + 1..].iter().collect::<String>().to_lowercase();
+        if !pre
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        let mut names: Vec<String> = c
+            .members
+            .iter()
+            .filter(|u| u.to_lowercase().starts_with(&pre))
+            .cloned()
+            .collect();
+        names.sort();
+        names.truncate(5);
+        // already typed in full: let Enter send
+        if names.is_empty() || (names.len() == 1 && names[0].to_lowercase() == pre) {
+            return None;
+        }
+        Some((at, names))
+    }
+
+    fn complete_mention(&mut self, at: usize, name: &str) {
+        let (a, b) = (self.input.byte(at), self.input.byte(self.input.cur));
+        self.input.text.replace_range(a..b, &format!("@{name} "));
+        self.input.cur = at + name.chars().count() + 2;
+        self.mention_sel = 0;
+    }
+
+    fn draw_mentions(&self, f: &mut Frame, input: Rect) {
+        if self.focus != Focus::Input || self.popup.is_some() {
+            return;
+        }
+        let Some((_, names)) = self.mention_query() else {
+            return;
+        };
+        let w = names.iter().map(|n| n.len()).max().unwrap_or(0) as u16 + 6;
+        let h = (names.len() as u16 + 2).min(input.y);
+        let area = Rect {
+            x: input.x + 1,
+            y: input.y - h,
+            width: w.min(input.width.saturating_sub(2)),
+            height: h,
+        };
+        let items: Vec<ListItem> = names
+            .iter()
+            .map(|n| {
+                ListItem::new(Line::from(vec![
+                    " @".fg(th().dim),
+                    n.clone().fg(name_color(n)),
+                ]))
+            })
+            .collect();
+        let mut st = ratatui::widgets::ListState::default()
+            .with_selected(Some(self.mention_sel.min(names.len() - 1)));
+        f.render_widget(Clear, area);
+        f.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::new().fg(th().accent))
+                        .style(base()),
+                )
+                .highlight_style(Style::new().bg(th().selected_bg)),
+            area,
+            &mut st,
+        );
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         if let Some((msg, err, at)) = &self.toast
             && at.elapsed() < Duration::from_secs(5)
         {
-            let color = if *err { Color::LightRed } else { Color::Green };
+            let color = if *err { th().error } else { th().ok };
             return f.render_widget(Line::from(format!(" {msg}")).fg(color), area);
         }
         let hints: &[(&str, &str)] = match self.focus {
@@ -660,9 +793,10 @@ impl App {
                 ("⏎", "open"),
                 ("f", "add friend"),
                 ("g", "new group"),
+                ("+", "add to group"),
                 ("i", "info"),
                 ("d", "remove"),
-                ("a", "account"),
+                ("t", "theme"),
                 ("q", "quit"),
             ],
             Focus::Messages => &[
@@ -674,6 +808,7 @@ impl App {
             ],
             Focus::Input => &[
                 ("⏎", "send"),
+                ("@", "mention"),
                 ("Esc", "back"),
                 ("Ctrl-N/P", "switch chat"),
                 ("PgUp/PgDn", "scroll"),
@@ -689,9 +824,9 @@ impl App {
             None => {}
             Some(Popup::Help) => {
                 let key = |k: &'static str, d: &'static str| {
-                    Line::from(vec![format!("  {k:<18}").fg(ACCENT).bold(), d.into()])
+                    Line::from(vec![format!("  {k:<18}").fg(th().accent).bold(), d.into()])
                 };
-                let head = |s: &'static str| Line::from(s).bold().fg(Color::White);
+                let head = |s: &'static str| Line::from(s).bold().fg(th().bright);
                 let text = vec![
                     head("Moving around"),
                     key("Tab / Shift-Tab", "switch between chats, messages, input"),
@@ -704,17 +839,26 @@ impl App {
                     head("Friends & groups"),
                     key("f", "add a friend (their username)"),
                     key("g", "new group (3+ people)"),
+                    key("+", "add people to the open group"),
+                    key("@name", "mention someone (Tab completes)"),
                     key("i", "members & key fingerprints"),
                     key("d", "remove friend / group from this device"),
                     key("a", "account & server"),
                     Line::default(),
+                    head("Themes"),
+                    key("t", "pick a theme"),
+                    Line::from(vec![
+                        "  Have an AI make one: ".into(),
+                        "claude mcp add chatui -- chatui mcp".fg(th().accent),
+                    ]),
+                    Line::default(),
                     head("Message status"),
                     Line::from(vec![
-                        "  ◷ ".fg(DIM),
+                        "  ◷ ".fg(th().dim),
                         "sending   ".into(),
-                        "✓ ".fg(Color::Gray),
+                        "✓ ".fg(th().muted),
                         "sent   ".into(),
-                        "✓✓ ".fg(ACCENT),
+                        "✓✓ ".fg(th().accent),
                         "read".into(),
                     ]),
                 ];
@@ -741,7 +885,7 @@ impl App {
                 };
                 let mut text = vec![
                     Line::from(vec![
-                        (if c.group { "# " } else { "@ " }).fg(ACCENT),
+                        (if c.group { "# " } else { "@ " }).fg(th().accent),
                         c.name.clone().bold(),
                     ]),
                     Line::from(if c.group {
@@ -757,7 +901,7 @@ impl App {
                             if c.msgs.len() == 1 { "" } else { "s" }
                         )
                     })
-                    .fg(DIM),
+                    .fg(th().dim),
                     Line::default(),
                     Line::from("Key fingerprints").bold(),
                 ];
@@ -768,16 +912,17 @@ impl App {
                     ]));
                 }
                 text.push(Line::from(vec![
-                    format!("  {:<20}", "you").fg(ACCENT),
+                    format!("  {:<20}", "you").fg(th().accent),
                     fingerprint(&self.sk.public_key().to_bytes()).into(),
                 ]));
                 text.push(Line::default());
                 text.push(
                     Line::from("Compare these with your friends in person or over another app.")
-                        .fg(DIM),
+                        .fg(th().dim),
                 );
                 text.push(
-                    Line::from("If they match, nobody can read or fake your messages.").fg(DIM),
+                    Line::from("If they match, nobody can read or fake your messages.")
+                        .fg(th().dim),
                 );
                 let area = centered(screen, 68, text.len() as u16 + 4);
                 f.render_widget(Clear, area);
@@ -801,8 +946,8 @@ impl App {
                             "?".into(),
                         ]),
                         Line::default(),
-                        Line::from("Its history is deleted from this device and").fg(DIM),
-                        Line::from("you stop receiving its messages.").fg(DIM),
+                        Line::from("Its history is deleted from this device and").fg(th().dim),
+                        Line::from("you stop receiving its messages.").fg(th().dim),
                     ]
                 } else {
                     vec![
@@ -812,8 +957,8 @@ impl App {
                             " from your friends?".into(),
                         ]),
                         Line::default(),
-                        Line::from("Your chat history with them is deleted from").fg(DIM),
-                        Line::from("this device. If they write again, they reappear.").fg(DIM),
+                        Line::from("Your chat history with them is deleted from").fg(th().dim),
+                        Line::from("this device. If they write again, they reappear.").fg(th().dim),
                     ]
                 };
                 let area = centered(screen, 56, 8);
@@ -835,22 +980,22 @@ impl App {
                 let rows = Layout::vertical([Constraint::Length(1); 7]).split(inner);
                 f.render_widget(
                     Line::from(vec![
-                        format!("{:<10}", "Username").fg(Color::Gray),
+                        format!("{:<10}", "Username").fg(th().muted),
                         self.me.clone().bold(),
                     ]),
                     rows[0],
                 );
                 f.render_widget(
                     Line::from(vec![
-                        format!("{:<10}", "Key").fg(Color::Gray),
+                        format!("{:<10}", "Key").fg(th().muted),
                         fingerprint(&self.sk.public_key().to_bytes()).into(),
                     ]),
                     rows[1],
                 );
                 f.render_widget(
                     Line::from(vec![
-                        format!("{:<10}", "Data").fg(Color::Gray),
-                        self.dir.display().to_string().fg(DIM),
+                        format!("{:<10}", "Data").fg(th().muted),
+                        self.dir.display().to_string().fg(th().dim),
                     ]),
                     rows[2],
                 );
@@ -859,7 +1004,7 @@ impl App {
                     Line::from(
                         "Changing server keeps your key; your name is claimed on the new relay.",
                     )
-                    .fg(DIM),
+                    .fg(th().dim),
                     rows[6],
                 );
             }
@@ -887,20 +1032,21 @@ impl App {
                     .collect();
                 if !known.is_empty() {
                     f.render_widget(
-                        Line::from(format!("from your groups: {}", known.join(", "))).fg(DIM),
+                        Line::from(format!("from your groups: {}", known.join(", "))).fg(th().dim),
                         rows[2],
                     );
                 }
                 f.render_widget(
                     Line::from(err.as_str()).fg(if err.ends_with('…') {
-                        Color::Yellow
+                        th().warn
                     } else {
-                        Color::LightRed
+                        th().error
                     }),
                     rows[4],
                 );
             }
             Some(Popup::NewGroup {
+                group,
                 name,
                 add,
                 picks,
@@ -912,11 +1058,22 @@ impl App {
                 let area = centered(screen, 60, list_h + 12);
                 f.render_widget(Clear, area);
                 let block = popup_block(
-                    "New group",
+                    if group.is_some() {
+                        "Add to group"
+                    } else {
+                        "New group"
+                    },
                     &[
                         ("Tab", "next"),
                         ("Space", "toggle"),
-                        ("⏎", "add / create"),
+                        (
+                            "⏎",
+                            if group.is_some() {
+                                "add"
+                            } else {
+                                "add / create"
+                            },
+                        ),
                         ("Esc", "cancel"),
                     ],
                 );
@@ -933,7 +1090,18 @@ impl App {
                     Constraint::Min(1),
                 ])
                 .areas(inner);
-                input_row(f, r_name, "Name", name, *focus == 0, "e.g. weekend plans");
+                if group.is_some() {
+                    f.render_widget(
+                        Line::from(vec![
+                            format!("{:<10}", "Group").fg(th().muted),
+                            "# ".fg(th().accent),
+                            name.text.clone().bold(),
+                        ]),
+                        r_name,
+                    );
+                } else {
+                    input_row(f, r_name, "Name", name, *focus == 0, "e.g. weekend plans");
+                }
                 input_row(
                     f,
                     r_add,
@@ -944,28 +1112,35 @@ impl App {
                 );
                 let picked = picks.iter().filter(|p| p.1).count();
                 let label_style = if *focus == 2 {
-                    Style::new().fg(ACCENT).bold()
+                    Style::new().fg(th().accent).bold()
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(th().muted)
                 };
                 f.render_widget(
                     Line::from(vec![
                         Span::styled("Members", label_style),
-                        format!("  {picked} picked, you + 2 or more").fg(DIM),
+                        if group.is_some() {
+                            format!("  {picked} picked").fg(th().dim)
+                        } else {
+                            format!("  {picked} picked, you + 2 or more").fg(th().dim)
+                        },
                     ]),
                     r_label,
                 );
                 if picks.is_empty() {
-                    f.render_widget(Line::from("  add people by username above").fg(DIM), r_list);
+                    f.render_widget(
+                        Line::from("  add people by username above").fg(th().dim),
+                        r_list,
+                    );
                 } else {
                     let items: Vec<ListItem> = picks
                         .iter()
                         .map(|(u, on)| {
                             ListItem::new(Line::from(vec![
                                 if *on {
-                                    " [x] ".fg(ACCENT)
+                                    " [x] ".fg(th().accent)
                                 } else {
-                                    " [ ] ".fg(DIM)
+                                    " [ ] ".fg(th().dim)
                                 },
                                 u.clone().fg(name_color(u)),
                             ]))
@@ -974,7 +1149,7 @@ impl App {
                     let mut st = ratatui::widgets::ListState::default()
                         .with_selected((*focus == 2).then_some(*cursor));
                     f.render_stateful_widget(
-                        List::new(items).highlight_style(Style::new().bg(SELECTED_BG)),
+                        List::new(items).highlight_style(Style::new().bg(th().selected_bg)),
                         r_list,
                         &mut st,
                     );
@@ -982,12 +1157,52 @@ impl App {
                 f.render_widget(
                     Paragraph::new(err.as_str())
                         .fg(if err.ends_with('…') {
-                            Color::Yellow
+                            th().warn
                         } else {
-                            Color::LightRed
+                            th().error
                         })
                         .wrap(Wrap { trim: true }),
                     r_err,
+                );
+            }
+            Some(Popup::Themes { names, cursor }) => {
+                let list_h = names.len().min(12) as u16;
+                let area = centered(screen, 52, list_h + 7);
+                f.render_widget(Clear, area);
+                let block = popup_block(
+                    "Theme",
+                    &[("↑↓", "preview"), ("⏎", "use"), ("Esc", "cancel")],
+                );
+                let inner = block.inner(area).inner(Margin::new(2, 1));
+                f.render_widget(block, area);
+                let [r_list, _, r_tip] = Layout::vertical([
+                    Constraint::Length(list_h),
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                ])
+                .areas(inner);
+                let active = theme::active_name(&self.dir);
+                let items: Vec<ListItem> = names
+                    .iter()
+                    .map(|n| {
+                        ListItem::new(Line::from(vec![
+                            (if *n == active { " ● " } else { "   " }).fg(th().accent),
+                            n.clone().into(),
+                        ]))
+                    })
+                    .collect();
+                let mut st = ratatui::widgets::ListState::default().with_selected(Some(*cursor));
+                f.render_stateful_widget(
+                    List::new(items).highlight_style(Style::new().bg(th().selected_bg)),
+                    r_list,
+                    &mut st,
+                );
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from("Want a new one? Ask an AI, after:").fg(th().dim),
+                        Line::from("claude mcp add chatui -- chatui mcp").fg(th().accent),
+                    ]),
+                    r_tip,
                 );
             }
         }
@@ -1060,6 +1275,7 @@ impl App {
                     .map(|c| (c.id.clone(), false))
                     .collect();
                 self.popup = Some(Popup::NewGroup {
+                    group: None,
                     name: Field::default(),
                     add: Field::default(),
                     picks,
@@ -1067,6 +1283,34 @@ impl App {
                     focus: 0,
                     err: String::new(),
                 });
+            }
+            KeyCode::Char('+') if self.store.chats.get(self.sel).is_some_and(|c| c.group) => {
+                let c = &self.store.chats[self.sel];
+                let picks = self
+                    .store
+                    .chats
+                    .iter()
+                    .filter(|f| !f.group && !c.members.contains(&f.id))
+                    .map(|f| (f.id.clone(), false))
+                    .collect();
+                self.popup = Some(Popup::NewGroup {
+                    group: Some(c.id.clone()),
+                    name: Field::from(c.name.as_str()),
+                    add: Field::default(),
+                    picks,
+                    cursor: 0,
+                    focus: 1,
+                    err: String::new(),
+                });
+            }
+            KeyCode::Char('+') => {
+                self.notify("open a group first, then press + to add people", true)
+            }
+            KeyCode::Char('t') => {
+                let names = theme::list(&self.dir);
+                let active = theme::active_name(&self.dir);
+                let cursor = names.iter().position(|n| *n == active).unwrap_or(0);
+                self.popup = Some(Popup::Themes { names, cursor });
             }
             KeyCode::Char('i') if has_chat => self.popup = Some(Popup::Info),
             KeyCode::Char('d') if has_chat => self.popup = Some(Popup::Delete),
@@ -1110,6 +1354,18 @@ impl App {
     }
 
     fn key_input(&mut self, k: KeyEvent) {
+        if let Some((at, names)) = self.mention_query() {
+            let n = names.len();
+            match k.code {
+                KeyCode::Tab | KeyCode::Enter => {
+                    let name = names[self.mention_sel.min(n - 1)].clone();
+                    return self.complete_mention(at, &name);
+                }
+                KeyCode::Up => return self.mention_sel = (self.mention_sel + n - 1) % n,
+                KeyCode::Down => return self.mention_sel = (self.mention_sel + 1) % n,
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::Esc => self.focus = Focus::Chats,
             KeyCode::Tab => self.cycle_focus(false),
@@ -1127,6 +1383,7 @@ impl App {
             }
             _ => {
                 self.input.edit(k);
+                self.mention_sel = 0;
             }
         }
     }
@@ -1196,6 +1453,7 @@ impl App {
                 }
             },
             Popup::NewGroup {
+                group,
                 name,
                 add,
                 picks,
@@ -1206,11 +1464,13 @@ impl App {
                 if esc {
                     return;
                 }
+                // adding to an existing group: the name row is fixed, focus skips it
+                let first = if group.is_some() { 1 } else { 0 };
                 match (k.code, *focus) {
                     (KeyCode::Tab | KeyCode::Down, 0 | 1) | (KeyCode::Enter, 0) => *focus += 1,
-                    (KeyCode::Tab, 2) => *focus = 0,
-                    (KeyCode::BackTab, _) => *focus = (*focus + 2) % 3,
-                    (KeyCode::Up, 1) => *focus = 0,
+                    (KeyCode::Tab, 2) => *focus = first,
+                    (KeyCode::BackTab, f) => *focus = if f == first { 2 } else { f - 1 },
+                    (KeyCode::Up, 1) => *focus = first,
                     (KeyCode::Up, 2) if *cursor == 0 => *focus = 1,
                     (KeyCode::Up, 2) => *cursor -= 1,
                     (KeyCode::Down, 2) => {
@@ -1242,12 +1502,13 @@ impl App {
                     }
                     (KeyCode::Enter, _) => {
                         let users = picks.iter().filter(|p| p.1).map(|p| p.0.clone()).collect();
-                        *err = match self.new_group(&name.text, users) {
-                            Ok(()) => "creating…".into(),
-                            Err(e) => e,
+                        let res = match group {
+                            Some(id) => self.add_members(id, users).map(|_| "adding…"),
+                            None => self.new_group(&name.text, users).map(|_| "creating…"),
                         };
+                        *err = res.map_or_else(|e| e, String::from);
                     }
-                    (_, 0) => {
+                    (_, 0) if group.is_none() => {
                         name.edit(k);
                     }
                     (_, 1) => {
@@ -1256,6 +1517,33 @@ impl App {
                     _ => {}
                 }
                 true
+            }
+            Popup::Themes { names, cursor } => {
+                let pick = |c: usize| names.get(c).cloned().unwrap_or_default();
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                        *cursor = match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => cursor.saturating_sub(1),
+                            _ => (*cursor + 1).min(names.len().saturating_sub(1)),
+                        };
+                        if let Ok(t) = theme::load(&self.dir, &pick(*cursor)) {
+                            theme::set(t);
+                        }
+                        true
+                    }
+                    KeyCode::Enter => {
+                        match theme::activate(&self.dir, &pick(*cursor)) {
+                            Ok(t) => theme::set(t),
+                            Err(e) => self.notify(e, true),
+                        }
+                        false
+                    }
+                    KeyCode::Esc | KeyCode::Char('t' | 'q') => {
+                        self.reload_theme();
+                        false
+                    }
+                    _ => true,
+                }
             }
         };
         if keep && !esc {

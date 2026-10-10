@@ -1,5 +1,7 @@
 mod client;
+mod mcp;
 mod server;
+mod theme;
 
 use crypto_box::aead::generic_array::GenericArray;
 use crypto_box::aead::{Aead, AeadCore, OsRng};
@@ -265,7 +267,9 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 
 const USAGE: &str = "usage:
   chatui                 open the chat (first run asks for a username and server)
-  chatui serve [addr]    run a relay server (default [::]:6769)";
+  chatui serve [addr]    run a relay server (default [::]:6769)
+  chatui mcp             MCP server so an AI can design themes
+                         (claude mcp add chatui -- chatui mcp)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -279,6 +283,7 @@ fn main() {
             server::run(addr, &home().join("server.json"));
             Ok(())
         }
+        ["mcp"] => mcp::run(),
         [] => client::run(),
         _ => Err(USAGE.into()),
     };

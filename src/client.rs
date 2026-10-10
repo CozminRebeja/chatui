@@ -1,5 +1,6 @@
 mod ui;
 
+use crate::theme;
 use crate::*;
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
@@ -119,6 +120,8 @@ struct App {
     list: ratatui::widgets::ListState,
     rects: Rects,
     quit: bool,
+    mention_sel: usize, // highlighted @name suggestion
+    theme_err: String,  // last theme load error, so it's shown once
 }
 
 fn rand_id() -> String {
@@ -129,6 +132,39 @@ fn rand_id() -> String {
 
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Byte ranges of `@name` tokens (the @ included): an @ at the start or after
+/// whitespace, followed by username characters.
+fn mentions(text: &str) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let name = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let mut out = vec![];
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'@' && (i == 0 || text[..i].ends_with(char::is_whitespace)) {
+            let len = b[i + 1..].iter().take_while(|&&c| name(c)).count();
+            if (1..=20).contains(&len) {
+                out.push((i, i + 1 + len));
+            }
+        }
+    }
+    out
+}
+
+fn mentions_user(text: &str, user: &str) -> bool {
+    mentions(text).iter().any(|&(a, b)| &text[a + 1..b] == user)
+}
+
+/// A line in the timeline that isn't anyone's message ("alice added bob").
+fn notice(text: String) -> Msg {
+    Msg {
+        id: rand_id(),
+        from: String::new(),
+        text,
+        ts: Utc::now(),
+        status: Status::Read,
+        read_by: vec![],
+    }
 }
 
 pub fn run() -> Result<(), String> {
@@ -178,7 +214,10 @@ pub fn run() -> Result<(), String> {
         list: Default::default(),
         rects: Default::default(),
         quit: false,
+        mention_sel: 0,
+        theme_err: String::new(),
     };
+    app.reload_theme();
     if app.setup.is_none() {
         app.connect();
     }
@@ -196,7 +235,7 @@ impl App {
         term: &mut ratatui::DefaultTerminal,
         rx: Receiver<Ev>,
     ) -> Result<(), String> {
-        let mut last_try = Instant::now();
+        let (mut last_try, mut last_theme) = (Instant::now(), Instant::now());
         while !self.quit {
             term.draw(|f| self.draw(f)).map_err(|e| e.to_string())?;
             if self.setup.as_ref().is_some_and(|s| s.busy) {
@@ -227,8 +266,29 @@ impl App {
                 self.connect();
             }
             self.mark_read();
+            // pick up themes written by `chatui mcp`; not while previewing in the picker
+            if last_theme.elapsed() > Duration::from_secs(1)
+                && !matches!(self.popup, Some(Popup::Themes { .. }))
+            {
+                last_theme = Instant::now();
+                self.reload_theme();
+            }
         }
         Ok(())
+    }
+
+    fn reload_theme(&mut self) {
+        match theme::load(&self.dir, &theme::active_name(&self.dir)) {
+            Ok(t) => {
+                theme::set(t);
+                self.theme_err.clear();
+            }
+            Err(e) if e != self.theme_err => {
+                self.notify(e.clone(), true);
+                self.theme_err = e;
+            }
+            Err(_) => {}
+        }
     }
 
     fn notify(&mut self, msg: impl Into<String>, err: bool) {
@@ -466,7 +526,7 @@ impl App {
             self.focus = Focus::Input;
             return Ok(());
         }
-        self.request_keys(vec![user.into()], String::new())
+        self.request_keys(vec![user.into()], String::new(), String::new())
     }
 
     fn new_group(&mut self, name: &str, users: Vec<String>) -> Result<(), String> {
@@ -476,15 +536,36 @@ impl App {
         if users.len() < 2 {
             return Err("pick at least 2 people (3+ with you)".into());
         }
-        self.request_keys(users, clean(name.trim()))
+        self.request_keys(users, clean(name.trim()), String::new())
     }
 
-    /// Ask the server for public keys; the chat is created when they arrive (`on_keys`).
-    fn request_keys(&mut self, users: Vec<String>, group: String) -> Result<(), String> {
+    fn add_members(&mut self, chat: &str, users: Vec<String>) -> Result<(), String> {
+        let Some(c) = self.find(chat).map(|i| &self.store.chats[i]) else {
+            return Err("that group is gone".into());
+        };
+        let users: Vec<String> = users
+            .into_iter()
+            .filter(|u| !c.members.contains(u))
+            .collect();
+        if users.is_empty() {
+            return Err("pick someone who isn't in the group yet".into());
+        }
+        self.request_keys(users, String::new(), chat.into())
+    }
+
+    /// Ask the server for public keys; the chat is created (or, with `id`, the
+    /// group grown) when they arrive (`on_keys`).
+    fn request_keys(
+        &mut self,
+        users: Vec<String>,
+        group: String,
+        id: String,
+    ) -> Result<(), String> {
         if self.write(&Pkt {
             t: "keys".into(),
             users,
             group,
+            id,
             ..Default::default()
         }) {
             Ok(())
@@ -540,7 +621,11 @@ impl App {
             ));
         }
         self.store.contacts.extend(p.keys.clone());
-        let ci = if p.group.is_empty() {
+        let ci = if !p.id.is_empty() {
+            let Some(ci) = self.find(&p.id) else { return };
+            self.grow_group(ci, &p.users);
+            ci
+        } else if p.group.is_empty() {
             let u = p.users[0].clone();
             self.find(&u)
                 .unwrap_or_else(|| self.add_chat(Chat::new(u.clone(), u, p.users, false)))
@@ -565,6 +650,50 @@ impl App {
         self.popup = None;
         self.focus = Focus::Input;
         self.commit();
+    }
+
+    /// Invite `new` people with the full member list, and tell everyone already
+    /// in the group so they accept messages from them.
+    fn grow_group(&mut self, ci: usize, new: &[String]) {
+        let c = &self.store.chats[ci];
+        let (id, name, old) = (c.id.clone(), c.name.clone(), c.members.clone());
+        let new: Vec<String> = new
+            .iter()
+            .filter(|u| !old.contains(u) && **u != self.me)
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let keys = |us: &[String]| -> BTreeMap<String, Key> {
+            us.iter()
+                .filter_map(|u| Some((u.clone(), *self.store.contacts.get(u)?)))
+                .collect()
+        };
+        let mut members = keys(&[old.as_slice(), &new].concat());
+        members.insert(self.me.clone(), self.sk.public_key().to_bytes());
+        let invite = Payload {
+            t: "group".into(),
+            chat: id.clone(),
+            name,
+            members,
+            ..Default::default()
+        };
+        let added = Payload {
+            t: "add".into(),
+            chat: id,
+            members: keys(&new),
+            ..Default::default()
+        };
+        for u in &new {
+            self.send_to(u, "", &invite);
+        }
+        for u in &old {
+            self.send_to(u, "", &added);
+        }
+        let c = &mut self.store.chats[ci];
+        c.members.extend(new.iter().cloned());
+        c.msgs.push(notice(format!("you added {}", new.join(", "))));
     }
 
     fn popup_error(&mut self, e: String) {
@@ -614,16 +743,31 @@ impl App {
                 if !c.members.contains(&from) || c.msgs.iter().any(|x| x.id == m.id) {
                     return;
                 }
+                let text = clean(&m.text);
+                let ping = mentions_user(&text, &self.me).then(|| {
+                    let place = if c.group {
+                        format!(" in #{}", c.name)
+                    } else {
+                        String::new()
+                    };
+                    format!("{from} mentioned you{place}")
+                });
                 c.msgs.push(Msg {
                     id: m.id,
                     from,
-                    text: clean(&m.text),
+                    text,
                     ts: m.ts,
                     status: Status::Pending,
                     read_by: vec![],
                 });
                 // keep the timeline ordered even if a resend arrives late
                 c.msgs.sort_by_key(|x| x.ts);
+                if let Some(ping) = ping {
+                    let _ = io::stdout()
+                        .write_all(b"\x07")
+                        .and_then(|_| io::stdout().flush());
+                    self.notify(ping, false);
+                }
             }
             "read" => {
                 let Some(ci) = self.find(&chat_id) else {
@@ -664,11 +808,160 @@ impl App {
                     .filter(|u| **u != self.me)
                     .cloned()
                     .collect();
-                self.add_chat(Chat::new(m.chat, clean(&m.name), members, true));
+                let mut c = Chat::new(m.chat, clean(&m.name), members, true);
+                c.msgs.push(notice(format!("{from} added you")));
+                self.add_chat(c);
                 self.notify(format!("{from} added you to a group"), false);
+            }
+            "add" => {
+                let Some(ci) = self.find(&m.chat) else { return };
+                let c = &self.store.chats[ci];
+                // only someone already in the group can add people to it
+                if !c.group
+                    || !c.members.contains(&from)
+                    || !m.members.keys().all(|u| valid_name(u))
+                {
+                    return;
+                }
+                let new: Vec<String> = m
+                    .members
+                    .keys()
+                    .filter(|u| **u != self.me && !c.members.contains(u))
+                    .cloned()
+                    .collect();
+                if new.is_empty() {
+                    return;
+                }
+                for u in &new {
+                    self.store.contacts.entry(u.clone()).or_insert(m.members[u]);
+                }
+                let c = &mut self.store.chats[ci];
+                c.members.extend(new.iter().cloned());
+                c.msgs
+                    .push(notice(format!("{from} added {}", new.join(", "))));
             }
             _ => return,
         }
         self.commit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn mention_tokens() {
+        let t = "hi @bob, @al-x and a@b @ @abcdefghijklmnopqrstu";
+        let found: Vec<&str> = mentions(t).iter().map(|&(a, b)| &t[a..b]).collect();
+        assert_eq!(found, ["@bob", "@al-x"]);
+        assert!(mentions_user("@bob hi", "bob") && !mentions_user("@bobby hi", "bob"));
+    }
+
+    fn app(server: &str, me: &str) -> (App, Receiver<Ev>) {
+        let dir = std::env::temp_dir().join(format!("chatui-app-{}-{me}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut a = App {
+            me: me.into(),
+            server: server.into(),
+            sk: SecretKey::generate(&mut OsRng),
+            store: Store::default(),
+            dir,
+            sel: 0,
+            conn: None,
+            generation: 0,
+            tx,
+            setup: None,
+            focus: Focus::Chats,
+            popup: None,
+            input: Field::default(),
+            scroll: 0,
+            toast: None,
+            list: Default::default(),
+            rects: Default::default(),
+            quit: false,
+            mention_sel: 0,
+            theme_err: String::new(),
+        };
+        a.connect();
+        assert!(a.conn.is_some(), "{me} couldn't connect");
+        (a, rx)
+    }
+
+    /// Feed incoming packets to the app until `done` holds.
+    fn until(a: &mut App, rx: &Receiver<Ev>, done: impl Fn(&App) -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !done(a) {
+            assert!(Instant::now() < end, "{} timed out", a.me);
+            if let Ok(Ev::Pkt(p)) = rx.recv_timeout(Duration::from_millis(20)) {
+                a.on_pkt(p);
+            }
+        }
+    }
+
+    fn group(a: &App) -> Option<&Chat> {
+        a.store.chats.iter().find(|c| c.group)
+    }
+
+    #[test]
+    fn add_to_group_and_mention() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let state = std::env::temp_dir().join(format!("chatui-grp-{}.json", std::process::id()));
+        let st = state.clone();
+        std::thread::spawn(move || server::serve(l, &st));
+
+        let (mut alice, ra) = app(&addr, "alice");
+        let (mut bob, rb) = app(&addr, "bob");
+        let (mut carol, rc) = app(&addr, "carol");
+        let (mut dave, rd) = app(&addr, "dave");
+
+        alice
+            .new_group("trip", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        until(&mut alice, &ra, |a| group(a).is_some());
+        let gid = group(&alice).unwrap().id.clone();
+        until(&mut bob, &rb, |a| group(a).is_some());
+        until(&mut carol, &rc, |a| group(a).is_some());
+
+        // carol adds dave, who wasn't in it
+        assert!(carol.add_members(&gid, vec!["bob".into()]).is_err());
+        carol.add_members(&gid, vec!["dave".into()]).unwrap();
+        until(&mut carol, &rc, |a| {
+            group(a).unwrap().members.contains(&"dave".into())
+        });
+        until(&mut dave, &rd, |a| group(a).is_some());
+        let mut m = group(&dave).unwrap().members.clone();
+        m.sort();
+        assert_eq!(m, ["alice", "bob", "carol"]);
+        until(&mut bob, &rb, |a| {
+            group(a).unwrap().members.contains(&"dave".into())
+        });
+        assert_eq!(
+            group(&bob).unwrap().msgs.last().unwrap().text,
+            "carol added dave"
+        );
+        until(&mut alice, &ra, |a| {
+            group(a).unwrap().members.contains(&"dave".into())
+        });
+
+        // the new member's messages are accepted, and the mention pings bob
+        dave.sel = dave.find(&gid).unwrap();
+        dave.send_text("hey @bob".into());
+        until(&mut bob, &rb, |a| {
+            group(a).unwrap().msgs.iter().any(|m| m.from == "dave")
+        });
+        assert_eq!(bob.toast.as_ref().unwrap().0, "dave mentioned you in #trip");
+        until(&mut alice, &ra, |a| {
+            group(a).unwrap().msgs.iter().any(|m| m.from == "dave")
+        });
+
+        for a in [&alice, &bob, &carol, &dave] {
+            fs::remove_dir_all(&a.dir).ok();
+        }
+        fs::remove_file(&state).ok();
+        fs::remove_file(state.with_file_name("messages.jsonl")).ok();
     }
 }
