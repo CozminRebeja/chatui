@@ -1824,6 +1824,30 @@ impl App {
                 } else if text == "/tutorial" {
                     self.input.take();
                     self.start_tutorial();
+                } else if text == "/receipts" || text.starts_with("/receipts ") {
+                    self.input.take();
+                    match text["/receipts".len()..].trim() {
+                        "off" => {
+                            self.store.no_receipts = true;
+                            self.commit();
+                            self.notify(
+                                "read receipts off: senders won't see when you've read",
+                                false,
+                            );
+                        }
+                        "on" => {
+                            self.store.no_receipts = false;
+                            self.commit();
+                            self.notify("read receipts on", false);
+                        }
+                        _ => {
+                            let state = if self.store.no_receipts { "off" } else { "on" };
+                            self.notify(
+                                format!("read receipts are {state} (/receipts on or off)"),
+                                false,
+                            );
+                        }
+                    }
                 } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);

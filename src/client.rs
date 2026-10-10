@@ -26,6 +26,9 @@ struct Identity {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Store {
+    /// Set with `/receipts off`: don't tell senders we've read their messages.
+    #[serde(default)]
+    no_receipts: bool,
     contacts: BTreeMap<String, Key>,
     chats: Vec<Chat>,
     /// Keys we compared in person (safety numbers) or got through an invite code.
@@ -791,7 +794,11 @@ impl App {
 
     /// Send read receipts for everything unread in the open chat.
     fn mark_read(&mut self) {
-        if self.conn.is_none() || self.setup.is_some() || self.sel >= self.store.chats.len() {
+        if self.store.no_receipts
+            || self.conn.is_none()
+            || self.setup.is_some()
+            || self.sel >= self.store.chats.len()
+        {
             return;
         }
         let c = &self.store.chats[self.sel];
@@ -2174,6 +2181,67 @@ mod tests {
             matches!(alice.popup, Some(Popup::Tutorial(2))),
             "resumes at step 3"
         );
+    }
+
+    #[test]
+    fn receipts_can_be_turned_off() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let bob = SecretKey::generate(&mut OsRng);
+        alice
+            .store
+            .contacts
+            .insert("bob".into(), bob.public_key().to_bytes());
+        alice.store.chats.push(Chat::new(
+            "bob".into(),
+            "bob".into(),
+            vec!["bob".into()],
+            false,
+        ));
+        alice.store.chats[0].msgs.push(Msg {
+            id: "m1".into(),
+            from: "bob".into(),
+            text: "hi".into(),
+            ts: Utc::now(),
+            status: Status::Pending,
+            read_by: vec![],
+            reply: None,
+        });
+        alice.sel = 0;
+
+        alice.store.no_receipts = true;
+        alice.mark_read();
+        assert!(
+            matches!(alice.store.chats[0].msgs[0].status, Status::Pending),
+            "no receipt sent"
+        );
+
+        alice.store.no_receipts = false;
+        alice.mark_read();
+        assert!(
+            matches!(alice.store.chats[0].msgs[0].status, Status::Read),
+            "receipt sent when on"
+        );
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn receipts_command_switches_them_off_and_on() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.focus = Focus::Input;
+        let type_line = |a: &mut App, line: &str| {
+            for c in line.chars() {
+                a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        type_line(&mut alice, "/receipts off");
+        assert!(alice.store.no_receipts);
+        type_line(&mut alice, "/receipts on");
+        assert!(!alice.store.no_receipts);
+        assert!(alice.input.text.is_empty());
         fs::remove_file(&state).ok();
     }
 }
