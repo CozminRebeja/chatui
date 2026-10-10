@@ -253,6 +253,15 @@ fn load_store(dir: &Path, vault: &Vault) -> Result<Store, String> {
     Ok(store)
 }
 
+/// Turns mouse capture off when dropped, which also happens while a panic unwinds.
+struct MouseGuard;
+
+impl Drop for MouseGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let dir = home();
     let vault = crate::vault::unlock(&dir)?;
@@ -321,8 +330,10 @@ pub fn run() -> Result<(), String> {
     }
     let mut term = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // turns mouse capture off even if the app panics, otherwise the shell gets mouse movements as typed input
+    let mouse = MouseGuard;
     let res = app.run_loop(&mut term, rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    drop(mouse);
     ratatui::restore();
     res
 }
@@ -1899,4 +1910,5 @@ mod tests {
         fs::remove_file(&state).ok();
         fs::remove_file(state.with_file_name("messages.jsonl")).ok();
     }
+
 }
