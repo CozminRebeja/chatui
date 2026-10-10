@@ -1086,7 +1086,7 @@ impl App {
                     key("/grant, /revoke", "group admin: let a member remove people"),
                     key("/leave", "leave the open group"),
                     key("/receipts on|off", "show or hide read receipts"),
-                    key("/notify on|off", "desktop notifications (Linux)"),
+                    key("/notify on|off", "desktop notifications"),
                     key("/tutorial", "the first-run tour again"),
                     Line::default(),
                     head("Themes"),

@@ -72,7 +72,7 @@ Type these in the message box:
 | `/grant <name>` / `/revoke <name>` | group admin: let a member remove people, or take that back |
 | `/leave` | leave the open group (the admin can't leave yet) |
 | `/receipts on` / `off` | show or hide read receipts |
-| `/notify on` / `off` | desktop notifications for new messages (Linux, through `notify-send`) |
+| `/notify on` / `off` | desktop notifications for new messages (Linux, macOS, Windows) |
 | `/tutorial` / `/help` | the first-run tour again / every key |
 
 Whoever makes a group is its admin. Only the admin, or a member the admin has

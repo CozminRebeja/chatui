@@ -242,12 +242,39 @@ fn alert_text(from: &str, group: Option<&str>, text: &str) -> String {
     }
 }
 
-/// Shows a desktop notification through the system's notify-send, if there is one.
-/// The text goes in as an argument, never through a shell.
+/// Shows a desktop notification with the system's own tool: notify-send on Linux,
+/// Notification Center on macOS, a balloon tip on Windows. The text goes in as an
+/// environment variable, never through a shell, so it can't be interpreted.
 fn notify_desktop(body: &str) {
-    let _ = std::process::Command::new("notify-send")
-        .args(["--app-name=chatui", "chatui", body])
-        .spawn();
+    let mut cmd = if cfg!(target_os = "linux") {
+        let mut c = std::process::Command::new("notify-send");
+        c.args(["--app-name=chatui", "chatui", body]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("osascript");
+        c.args([
+            "-e",
+            r#"display notification (system attribute "CHATUI_BODY") with title "chatui""#,
+        ]);
+        c.env("CHATUI_BODY", body);
+        c
+    } else {
+        let mut c = std::process::Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; \
+             $n.BalloonTipTitle = 'chatui'; $n.BalloonTipText = $env:CHATUI_BODY; \
+             $n.ShowBalloonTip(5000); Start-Sleep -Seconds 6; $n.Dispose()",
+        ]);
+        c.env("CHATUI_BODY", body);
+        c
+    };
+    let _ = cmd.spawn();
 }
 
 /// May `who` remove `target` from the group? The admin can remove anyone but
