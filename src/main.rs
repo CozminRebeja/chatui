@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -224,7 +225,9 @@ pub fn home() -> PathBuf {
     let p = std::env::var("CHATUI_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".chatui")
+            std::env::home_dir()
+                .expect("no home directory")
+                .join(".chatui")
         });
     fs::DirBuilder::new()
         .recursive(true)
@@ -233,6 +236,18 @@ pub fn home() -> PathBuf {
         .expect("create ~/.chatui");
     p
 }
+
+/// Windows has no mode bits, and the profile dir is already private to the user.
+#[cfg(not(unix))]
+trait NoMode {
+    fn mode(&mut self, _: u32) -> &mut Self {
+        self
+    }
+}
+#[cfg(not(unix))]
+impl NoMode for OpenOptions {}
+#[cfg(not(unix))]
+impl NoMode for fs::DirBuilder {}
 
 /// Atomic write, readable only by the owner.
 pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
