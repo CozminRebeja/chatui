@@ -129,3 +129,10 @@ messages are. Each account lives on one device. chatui's own code hasn't been
 independently audited; the cryptography comes from libraries that have.
 Upgrading from before 0.9: everyone in a chat needs the new version; older
 clients are told to update rather than silently dropped.
+
+## Contributing
+
+Pull requests are checked automatically (formatting, tests on Linux and macOS, a
+Windows build). Every change merged into `main` is released by itself: the
+version goes up, and apt, Homebrew and the Windows download follow within
+minutes. To release a bigger version, bump it in `Cargo.toml` in the PR.

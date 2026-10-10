@@ -1,48 +1,89 @@
-# Push a v* tag (or run by hand) to attach the .debs, chatui.exe and a signed
-# SHA256SUMS to the GitHub release, and publish the apt repo to GitHub Pages.
+# Every change to the code on main (a merged pull request, or a push) becomes a
+# release: tests pass, the version goes up, and the .debs, chatui.exe, a signed
+# SHA256SUMS, the apt repo and the Homebrew formula all follow.
 #
-# Hardening: every action is pinned to a full commit SHA (a moved tag can't swap
-# in new code), and the jobs that compile, which run third-party build scripts,
-# only get a read-only token. Uploading and signing happen in `publish`, which
-# runs no build at all.
+# Versions: if Cargo.toml's version hasn't been released yet (a PR bumped it on
+# purpose, e.g. to 0.10.0), that's the release; otherwise the patch number goes
+# up by one. Running it by hand (Actions → release → Run workflow) is a dry run
+# unless "publish" is ticked: it tests, works out the version and builds, but
+# pushes and publishes nothing.
+#
+# Hardening: every action is pinned to a full commit SHA, and the jobs that
+# compile (running third-party build scripts) only get a read-only token. The
+# jobs that can write never build anything.
 name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["src/**", "Cargo.toml", "Cargo.lock"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a release (unticked = dry run)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# one release at a time; a newer merge waits, and replaces any other waiting one
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   GH_REPO: ${{ github.repository }}
+  PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
 
 jobs:
-  release:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # Bump, tag and create the release. Pushes exactly the commit that was tested:
+  # if main moved on meanwhile, the push is refused and the run for the newer
+  # commit releases everything instead.
+  version:
+    needs: test
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          persist-credentials: false
-      - id: tag
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - id: v
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
-            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml ($tag)"; exit 1
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            IFS=. read -r major minor patch <<< "$v"
+            v="$major.$minor.$((patch + 1))"
+            sed -i "0,/^version = /s/^version = .*/version = \"$v\"/" Cargo.toml
+            sed -i '/^name = "chatui"$/{n;s/^version = .*/version = "'"$v"'"/}' Cargo.lock
+            cargo metadata --locked --format-version 1 >/dev/null # the lockfile still agrees
+            git -c user.name=github-actions[bot] \
+              -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+              commit -qam "v$v" -m "Released automatically after: $(git log -1 --format=%s HEAD)"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          gh release view "$tag" >/dev/null 2>&1 ||
-            gh release create "$tag" --title "$tag" --notes "" --target "$GITHUB_SHA"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" != true ]; then
+            echo "dry run: would release v$v"
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git tag "v$v"
+          git push --atomic origin HEAD:main "v$v"
+          gh release create "v$v" --title "v$v" --generate-notes --verify-tag
+          echo "ref=v$v" >> "$GITHUB_OUTPUT"
 
   deb:
-    needs: release
+    needs: version
     strategy:
       matrix:
         include:
@@ -54,6 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.ref }}
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
@@ -73,11 +115,12 @@ jobs:
           if-no-files-found: error
 
   windows:
-    needs: release
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ needs.version.outputs.ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
@@ -96,13 +139,14 @@ jobs:
   # Checksums signed with the apt key, so the .exe (which isn't code-signed) and
   # the .debs can be checked against a key whose fingerprint is in the README.
   publish:
-    needs: [release, deb, windows]
+    needs: [version, deb, windows]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.release.outputs.tag }}
+      TAG: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -137,10 +181,37 @@ jobs:
             commit -qm "apt repo $TAG"
           git push -f "https://x-access-token:$GH_TOKEN@github.com/$GH_REPO.git" gh-pages
 
+  # Point the Homebrew formula at the new tag's source tarball.
+  formula:
+    needs: [version, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+      - run: |
+          url="https://github.com/$GH_REPO/archive/refs/tags/$TAG.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          sed -i -e "s|^  url \".*\"|  url \"$url\"|" -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" Formula/chatui.rb
+          git diff --quiet && { echo "formula already at $TAG"; exit 0; }
+          git -c user.name=github-actions[bot] \
+            -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+            commit -qam "Formula: $TAG"
+          # someone may have merged meanwhile: replay on top and retry
+          for i in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull -q --rebase origin main
+          done
+          exit 1
+
   # Opens the PR to microsoft/winget-pkgs. The first version has to be submitted
   # by hand; after that set WINGET_TOKEN (classic PAT, public_repo scope).
   winget:
-    needs: [release, publish]
+    needs: [version, publish]
     runs-on: ubuntu-24.04
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
@@ -149,6 +220,6 @@ jobs:
         uses: vedantmgoyal9/winget-releaser@a8fff44b123f115ce4c21543edf8b677376fc7e0 # v2, 2026-09-20
         with:
           identifier: CozminRebeja.chatui
-          release-tag: ${{ needs.release.outputs.tag }}
+          release-tag: ${{ needs.version.outputs.tag }}
           installers-regex: '\.exe$'
           token: ${{ secrets.WINGET_TOKEN }}
