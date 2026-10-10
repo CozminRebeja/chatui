@@ -1,8 +1,8 @@
 class Chatui < Formula
   desc "Tiny end-to-end encrypted terminal chat for you and your friends"
   homepage "https://github.com/CozminRebeja/chatui"
-  url "https://github.com/CozminRebeja/chatui/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "a69ce37963bc442f3f53fda425423d00931d843f521e0555495df0d7a56e4718"
+  url "https://github.com/CozminRebeja/chatui/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "0384d5d77a138eb26866c191e04b0f51409cd8ca3826a6e608a87581ef739c97"
   head "https://github.com/CozminRebeja/chatui.git", branch: "main"
 
   depends_on "rust" => :build
