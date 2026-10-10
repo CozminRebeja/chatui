@@ -166,6 +166,12 @@ a Cloudflare Tunnel. `chat.example.com` connects on 443, `chat.example.com:8443`
 on that port. Unencrypted `ws://` works only for `localhost`, so the network
 can't see who talks to whom or hand out fake keys.
 
+Each address can have only a few logins in progress at once, so one machine
+can't keep everyone else out. Through a proxy on the same machine every
+connection looks like `127.0.0.1`, so the relay goes by the `CF-Connecting-IP`
+header a Cloudflare Tunnel adds (or `X-Forwarded-For`). Behind a proxy that
+sets neither, only the overall limit applies.
+
 ## Security
 
 - **End-to-end encrypted, with forward secrecy.** Each pair of people shares an

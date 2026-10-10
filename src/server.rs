@@ -2,10 +2,11 @@ use crate::*;
 use chrono::{DateTime, Utc};
 use crypto_box::aead::rand_core::RngCore;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::net::{TcpListener, UdpSocket};
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::{LazyLock, Mutex, mpsc};
 use tungstenite::WebSocket;
+use tungstenite::handshake::server::{Request, Response};
 
 const MAX_QUEUE: usize = 5000;
 const MAX_INBOX_BYTES: usize = 8 << 20; // ciphertext waiting for one offline user
@@ -14,8 +15,15 @@ const MAX_SENDS_TO_ONE: usize = 60; // to one person
 const MAX_SENDS: usize = 300; // to everyone
 const MAX_CONNS: usize = 512;
 const MAX_LOGINS: usize = 64; // connections that haven't logged in yet
+/// Of those, from any one address, so one machine can't take every login slot
+/// and keep everyone else out.
+const MAX_LOGINS_PER_IP: usize = 8;
 const MAX_KEYS: usize = 256; // users per key lookup
 const MAX_PREKEYS: usize = 50; // one-time prekeys held per user
+/// One-time prekeys one account may take from one person per hour; after that it
+/// gets their fallback key, so nobody can use up someone else's one-time keys.
+const MAX_OTK_CLAIMS: usize = 3;
+const CLAIM_WINDOW: Duration = Duration::from_secs(3600);
 /// The whole login, not each read: a client dripping bytes can't hold a slot forever.
 const LOGIN: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 const MAX_INVITES: usize = 3; // unused ones per person
@@ -79,6 +87,8 @@ struct Server {
     path: PathBuf,
     dirty: bool, // queue changed since the last save
     sent: HashMap<String, VecDeque<(Instant, String)>>, // each user's sends in the last minute; not saved
+    /// One-time prekeys taken in the last hour, by (who asked, whose); not saved.
+    claimed: HashMap<(String, String), VecDeque<Instant>>,
 }
 
 impl Server {
@@ -108,6 +118,46 @@ impl Drop for Slot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Holds one of an address's `MAX_LOGINS_PER_IP` login slots until dropped.
+struct IpSlot(IpAddr);
+
+static LOGINS_BY_IP: LazyLock<Mutex<HashMap<IpAddr, usize>>> = LazyLock::new(Default::default);
+
+impl IpSlot {
+    fn take(ip: IpAddr) -> Option<IpSlot> {
+        let mut m = LOGINS_BY_IP.lock().unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(ip).or_insert(0);
+        if *n >= MAX_LOGINS_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot(ip))
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut m = LOGINS_BY_IP.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// The visitor's address, as a proxy on this machine reports it: Cloudflare's
+/// tunnel sets CF-Connecting-IP. Only asked for connections from this machine.
+fn forwarded_ip(req: &Request) -> Option<IpAddr> {
+    let h = req.headers();
+    h.get("cf-connecting-ip")
+        .or_else(|| h.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The server's socket. Until `deadline` is cleared, every read gets only the
@@ -286,6 +336,7 @@ pub fn serve_with(l: TcpListener, path: &Path, udp: &str) {
         path: path.into(),
         dirty: false,
         sent: HashMap::new(),
+        claimed: HashMap::new(),
     })));
     // offline messages are saved in batches, so a burst of them isn't a burst of rewrites
     std::thread::spawn(|| {
@@ -328,6 +379,15 @@ fn accept(l: TcpListener, srv: &'static Mutex<Server>, calls: &'static Calls) {
     static CONNS: AtomicUsize = AtomicUsize::new(0);
     static LOGINS: AtomicUsize = AtomicUsize::new(0);
     for c in l.incoming().flatten() {
+        // a direct connection counts against its address now; one through a proxy on
+        // this machine (all from 127.0.0.1) once its headers say who it's really from
+        let ip = match c.peer_addr().map(|a| a.ip()) {
+            Ok(ip) if !ip.is_loopback() => match IpSlot::take(ip) {
+                Some(s) => Some(s),
+                None => continue,
+            },
+            _ => None,
+        };
         // over the limit: drop the socket, so a flood can't run us out of threads
         let Some(conn) = Slot::take(&CONNS, MAX_CONNS) else {
             continue;
@@ -338,7 +398,7 @@ fn accept(l: TcpListener, srv: &'static Mutex<Server>, calls: &'static Calls) {
         let id = CONN_ID.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
             let _conn = conn;
-            handle(c, id, srv, sk, calls, login)
+            handle(c, id, srv, sk, calls, login, ip)
         });
     }
 }
@@ -365,6 +425,7 @@ fn handle(
     sk: &SecretKey,
     calls: &Calls,
     login: Slot,
+    ip: Option<IpSlot>,
 ) -> Option<()> {
     c.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let ctl = c.try_clone().ok()?;
@@ -372,7 +433,18 @@ fn handle(
         tcp: c,
         deadline: Some(Instant::now() + LOGIN),
     };
-    let mut ws = tungstenite::accept_with_config(c, Some(ws_config())).ok()?;
+    let mut forwarded = None;
+    let read_headers = |req: &Request, resp: Response| {
+        forwarded = forwarded_ip(req);
+        Ok(resp)
+    };
+    let mut ws = tungstenite::accept_hdr_with_config(c, read_headers, Some(ws_config())).ok()?;
+    // through a proxy: now we know the address, and it's over its share, drop it
+    let ip = match (ip, forwarded) {
+        (Some(slot), _) => Some(slot),
+        (None, Some(addr)) => Some(IpSlot::take(addr)?),
+        (None, None) => None,
+    };
 
     let mut challenge = vec![0u8; 32];
     OsRng.fill_bytes(&mut challenge);
@@ -462,6 +534,7 @@ fn handle(
     }
 
     drop(login);
+    drop(ip);
     ws.get_mut().deadline = None;
     ctl.set_read_timeout(Some(POLL)).ok();
     pump(ws, rx, |mut p| {
@@ -606,14 +679,21 @@ fn handle(
                     return;
                 }
                 let mut keys = BTreeMap::new();
+                let now = Instant::now();
+                let s = &mut *s; // so `claimed` and `state` can be borrowed side by side
                 for u in &p.users {
                     if s.state.banned.contains(u) {
                         continue;
                     }
+                    let taken = s.claimed.entry((user.clone(), u.clone())).or_default();
+                    while taken.front().is_some_and(|t| now - *t >= CLAIM_WINDOW) {
+                        taken.pop_front();
+                    }
                     if let Some(pk) = s.state.prekeys.get_mut(u) {
-                        let k = if pk.otks.is_empty() {
+                        let k = if pk.otks.is_empty() || taken.len() >= MAX_OTK_CLAIMS {
                             pk.fallback
                         } else {
+                            taken.push_back(now);
                             Some(pk.otks.remove(0))
                         };
                         if let Some(k) = k {
@@ -711,6 +791,7 @@ mod tests {
             path: PathBuf::from("unused"),
             dirty: false,
             sent: HashMap::new(),
+            claimed: HashMap::new(),
         });
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = relay_state(&m);

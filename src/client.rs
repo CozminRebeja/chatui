@@ -319,7 +319,8 @@ fn alert_text(from: &str, group: Option<&str>, text: &str) -> String {
 fn notify_desktop(body: &str) {
     let mut cmd = if cfg!(target_os = "linux") {
         let mut c = std::process::Command::new("notify-send");
-        c.args(["--app-name=chatui", "chatui", body]);
+        // "--": a username may start with "-", and must not be read as an option
+        c.args(["--app-name=chatui", "--", "chatui", body]);
         c
     } else if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("osascript");
@@ -1915,14 +1916,13 @@ impl App {
                 };
                 match self.judge_roster(&c, &m) {
                     Judged::Valid => c.adopt_roster(&m, &self.me),
-                    Judged::Invalid => {
-                        c.msgs.push(notice(format!(
-                            "couldn't confirm {} as this group's admin, so nobody \
-                             can remove people until the real admin acts",
-                            c.admin
-                        )));
-                        c.admin = String::new();
-                    }
+                    // keep the name: clearing it would ignore the admin's later signed
+                    // rosters for good, and let anyone /claim the group on our side
+                    Judged::Invalid => c.msgs.push(notice(format!(
+                        "couldn't confirm {} as this group's admin yet: their own \
+                         signed list will settle it",
+                        c.admin
+                    ))),
                     Judged::Unknown => {}
                 }
                 c.pending = true;
@@ -3569,7 +3569,10 @@ mod tests {
         forge(&mut t.bob, &t.rb, &t.carol, first);
         drain(&mut t.carol, &t.rc);
         let c = &t.carol.store.chats[t.carol.find(&id).unwrap()];
-        assert_eq!(c.admin, "", "not confirmed, so nobody is the admin");
+        // flagged, not believed: no signed list is kept for it, and alice's own
+        // signed roster is what would settle it
+        assert_eq!(c.admin, "alice");
+        assert!(c.roster.is_none());
         assert!(c.msgs.iter().any(|m| m.text.contains("couldn't confirm")));
 
         // naming someone whose key carol has never seen can't be checked: that's the
