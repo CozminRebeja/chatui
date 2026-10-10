@@ -75,6 +75,15 @@ claude mcp add chatui -- chatui mcp
 Then ask for "a synthwave theme for chatui". A running chatui switches to it
 within a second. Themes are plain JSON in `~/.chatui/themes`.
 
+## Run the tests
+
+```sh
+cargo test
+```
+
+No server needs to be running: the tests start their own relay on a free local port.
+See [SECURITY.md](SECURITY.md) for what chatui protects and what it doesn't.
+
 ## Run your own relay
 
 ```sh

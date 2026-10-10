@@ -204,8 +204,21 @@ fn rand_id() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Strips control characters and invisible direction marks, which can make a name
+/// or message display backwards or look like someone else's. The zero-width joiner
+/// stays, since some emoji need it.
 fn clean(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|&c| !c.is_control() && !invisible(c))
+        .collect()
+}
+
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
 }
 
 /// Byte ranges of `@name` tokens (the @ included): an @ at the start or after
@@ -415,14 +428,15 @@ impl App {
         }
         let plain = zeroize::Zeroizing::new(serde_json::to_vec(&self.store).unwrap());
         if let Err(e) = self.vault.write(&self.dir.join("store.json"), &plain) {
-            panic!("could not save chat history: {e}");
+            // a full disk shouldn't close the app; the next save tries again
+            self.notify(format!("could not save chat history: {e}"), true);
         }
     }
 
-    fn save_olm(&self) {
+    fn save_olm(&mut self) {
         let plain = zeroize::Zeroizing::new(serde_json::to_vec(&self.olm).unwrap());
         if let Err(e) = self.vault.write(&self.dir.join("olm.json"), &plain) {
-            panic!("could not save encryption state: {e}");
+            self.notify(format!("could not save encryption state: {e}"), true);
         }
     }
 
@@ -1919,5 +1933,66 @@ mod tests {
         }
         fs::remove_file(&state).ok();
         fs::remove_file(state.with_file_name("messages.jsonl")).ok();
+    }
+
+    /// Help opens from any pane with ? or F1, and /help typed in the message box.
+    /// In the message box, ? is text, so it only opens help from the other panes.
+    #[test]
+    fn help_opens_from_every_pane() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let key = |code, mods| KeyEvent::new(code, mods);
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        let shift = KeyModifiers::SHIFT;
+
+        alice.focus = Focus::Chats;
+        alice.on_key(key(KeyCode::Char('?'), shift));
+        assert!(matches!(alice.popup, Some(Popup::Help)), "? in the chat list");
+        alice.popup = None;
+
+        alice.focus = Focus::Messages;
+        alice.on_key(key(KeyCode::Char('?'), shift));
+        assert!(matches!(alice.popup, Some(Popup::Help)), "? in the messages");
+        alice.popup = None;
+
+        alice.focus = Focus::Input;
+        alice.on_key(key(KeyCode::Char('?'), shift));
+        assert!(alice.popup.is_none(), "? while typing opens nothing");
+        assert_eq!(alice.input.text, "?");
+        alice.input = Field::default();
+
+        alice.on_key(key(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Help)), "F1 works while typing");
+        alice.popup = None;
+
+        for c in "/help".chars() {
+            alice.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        alice.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(alice.popup, Some(Popup::Help)), "/help opens help");
+        assert!(alice.input.text.is_empty(), "/help is not sent as a message");
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn full_disk_is_a_warning_not_a_crash() {
+        let (addr, state) = relay();
+        let (mut alice, _ra) = app(&addr, "alice", "");
+        alice.dir = PathBuf::from("/nonexistent-chatui-dir/for-test");
+        alice.commit(); // would have panicked before
+        let (msg, err, _) = alice.toast.clone().unwrap();
+        assert!(err && msg.starts_with("could not save chat history"), "{msg}");
+        fs::remove_file(&state).ok();
+    }
+
+    #[test]
+    fn clean_strips_direction_tricks() {
+        // a right-to-left override would make "alice" read backwards
+        assert_eq!(clean("\u{202E}ecila"), "ecila");
+        assert_eq!(clean("hi\u{200B}there\u{2066}\u{FEFF}"), "hithere");
+        assert_eq!(clean("tab\there\n"), "tabhere");
+        // ordinary text and emoji with joiners are untouched
+        assert_eq!(clean("ăîșț 😀"), "ăîșț 😀");
+        assert_eq!(clean("👨\u{200D}👩\u{200D}👧"), "👨\u{200D}👩\u{200D}👧");
     }
 }

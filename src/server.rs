@@ -271,7 +271,7 @@ pub fn serve(l: TcpListener, path: &Path) {
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let mut s = srv.lock().unwrap();
+            let mut s = relay_state(srv);
             if s.dirty {
                 s.save();
             }
@@ -295,6 +295,12 @@ pub fn serve(l: TcpListener, path: &Path) {
             handle(c, id, srv, sk, login)
         });
     }
+}
+
+/// Locks the relay state. If a connection panicked while holding the lock, keep
+/// serving with the state as it was, instead of every later connection panicking too.
+fn relay_state(m: &Mutex<Server>) -> std::sync::MutexGuard<'_, Server> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn err_pkt(e: &str, id: &str) -> Pkt {
@@ -343,7 +349,7 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
     let (tx, rx) = mpsc::channel();
     let mut inviter = String::new();
     {
-        let mut s = srv.lock().unwrap();
+        let mut s = relay_state(srv);
         let now = Utc::now();
         match s.state.users.get(&user) {
             Some(k) if *k != key => return refuse(ws, "username taken"),
@@ -406,7 +412,7 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
     ws.get_mut().deadline = None;
     ctl.set_read_timeout(Some(POLL)).ok();
     pump(ws, rx, |mut p| {
-        let mut s = srv.lock().unwrap();
+        let mut s = relay_state(srv);
         let Some(tx) = s
             .online
             .get(&user)
@@ -593,9 +599,30 @@ fn handle(c: TcpStream, conn: u64, srv: &Mutex<Server>, sk: &SecretKey, login: S
             _ => {}
         }
     });
-    let mut s = srv.lock().unwrap();
+    let mut s = relay_state(srv);
     if s.online.get(&user).is_some_and(|(id, _)| *id == conn) {
         s.online.remove(&user);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_one_connection_does_not_stop_the_relay() {
+        let m = Mutex::new(Server {
+            state: State::default(),
+            online: HashMap::new(),
+            path: PathBuf::from("unused"),
+            dirty: false,
+        });
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = relay_state(&m);
+            panic!("connection bug");
+        }));
+        assert!(m.is_poisoned());
+        assert!(relay_state(&m).state.users.is_empty()); // still usable
+    }
 }

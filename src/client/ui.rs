@@ -1493,6 +1493,10 @@ impl App {
             } else {
                 self.popup = Some(Popup::Delete);
             }
+        } else if k.code == KeyCode::F(1)
+            || (k.code == KeyCode::Char('?') && self.focus != Focus::Input)
+        {
+            self.popup = Some(Popup::Help);
         } else {
             match self.focus {
                 Focus::Chats => self.key_chats(k),
@@ -1609,7 +1613,6 @@ impl App {
                     server: Field::from(self.server.as_str()),
                 })
             }
-            KeyCode::Char('?') | KeyCode::F(1) => self.popup = Some(Popup::Help),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -1721,7 +1724,10 @@ impl App {
             KeyCode::Char('p') if ctrl(k) => self.select(self.sel.saturating_sub(1)),
             KeyCode::Enter => {
                 let text = self.input.text.trim().to_string();
-                if !text.is_empty() {
+                if text == "/help" {
+                    self.input.take();
+                    self.popup = Some(Popup::Help);
+                } else if !text.is_empty() {
                     self.input.take();
                     self.send_text(text);
                 }
